@@ -22,7 +22,8 @@ use pointer::DragTarget;
 
 pub use overlay::HighlightArea;
 
-use crate::wrapper::Wrapper;
+use crate::backend::{Backend, BackendEvent as Event, DisplayMetrics, Waker};
+pub use crate::backend::HostConfig;
 use crate::logging;
 use crate::menu::MenuController;
 use crate::native::NativeScroll;
@@ -31,32 +32,14 @@ use crate::scroll::ScrollProfile;
 use crate::scroll::profiles::Smooth;
 use crate::style::Color;
 use crate::terminal::{
-    Event, Handoff, KeyEvent, Mods, Mouse, MouseButton, MouseKind, Retarget, Terminal,
+    Handoff, KeyEvent, Mods, Mouse, MouseButton, MouseKind, Retarget, Terminal,
     TerminalColors,
 };
 use crate::text_input::InputReply;
 use crate::throttle::CpuThrottle;
 use crate::tree::{NodeId, PxRect};
 
-fn window_from(ws: &crate::terminal::WindowSize, cell: (u32, u32), cell_is_exact: bool) -> (u32, u32) {
-    let cols = if ws.cols > 0 { ws.cols } else { 80 };
-    let rows = if ws.rows > 0 { ws.rows } else { 24 };
-    let mut width = cols * cell.0;
-    let mut height = rows * cell.1;
-    if cell_is_exact {
-        return (width, height);
-    }
-    if ws.width_px > 0 {
-        width = width.min(ws.width_px / cell.0 * cell.0);
-    }
-    if ws.height_px > 0 {
-        height = height.min(ws.height_px / cell.1 * cell.1);
-    }
-    (width, height)
-}
-
 const PAINT_INTERVAL_WITH_INPUT_PENDING: Duration = Duration::from_millis(16);
-const CELL_REPLY_WAIT: Duration = Duration::from_millis(150);
 
 static DEFAULT_PROFILE: Smooth = Smooth {
     tau: 0.08,
@@ -66,19 +49,6 @@ static DEFAULT_PROFILE: Smooth = Smooth {
 pub struct EngineConfig {
     pub fonts: crate::fonts::FontRegistry,
     pub cell_metrics_font: usize,
-    pub watch_resize: bool,
-    pub tty: Option<String>,
-    pub host: Option<HostConfig>,
-    pub wrapper: Wrapper,
-    pub session_env: crate::terminal::SessionEnv,
-}
-
-#[derive(Debug, Clone)]
-pub struct HostConfig {
-    pub socket: String,
-    pub pane: String,
-    pub name: String,
-    pub tty: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +77,7 @@ impl ChangeSource {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
+    CloseRequested,
     HostClosed,
     Handoff {
         tty: Option<String>,
@@ -170,8 +141,9 @@ pub enum EngineEvent {
         view: usize,
         width: u32,
         height: u32,
-        cell: (u32, u32),
+        cell: Option<(u32, u32)>,
         base_px: f32,
+        scale_factor: f32,
     },
     Colors {
         colors: TerminalColors,
@@ -282,13 +254,12 @@ pub enum DragPhase {
 }
 
 pub struct Engine {
-    pub term: Terminal,
-    session_env: crate::terminal::SessionEnv,
+    backend: Box<dyn Backend>,
+    pub display: DisplayMetrics,
     pub comp: Compositor,
     pub fonts: crate::fonts::FontRegistry,
     cell_metrics_font: usize,
-    pub cell: (u32, u32),
-    cell_estimate: Option<(u32, u32)>,
+    pub cell: Option<(u32, u32)>,
     pub base_px: f32,
     pub colors: TerminalColors,
     cursor: Option<(f32, f32)>,
@@ -341,10 +312,6 @@ pub struct Engine {
     last_pointer_click: Option<Instant>,
     next_pasted_mark: u64,
     pending: Vec<EngineEvent>,
-    awaiting_cell: Option<(crate::terminal::WindowSize, Instant)>,
-    cell_exact: bool,
-    color_request_at: Option<Instant>,
-    last_color_request: Option<Instant>,
     last_step: Instant,
     last_frame: Instant,
     last_frame_bytes: usize,
@@ -354,63 +321,41 @@ pub struct Engine {
     pub stats: FrameStats,
 }
 
-const COLOR_SETTLE_DELAY: Duration = Duration::from_millis(50);
-const COLOR_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
-const RELAYED_RESIZE_POLL: Duration = Duration::from_millis(500);
-
 impl Engine {
-    pub fn new(config: EngineConfig) -> io::Result<Self> {
+    pub fn new(config: EngineConfig, mut backend: Box<dyn Backend>) -> io::Result<Self> {
         assert!(!config.fonts.is_empty());
-        let max_fps = frame::DEFAULT_MAX_FPS;
-        let mut term = match (&config.host, &config.tty) {
-            (Some(host), _) => match &host.tty {
-                Some(tty) => Terminal::join_embedded(&host.socket, &host.pane, &host.name, tty)?,
-                None => Terminal::join_host(&host.socket, &host.pane, &host.name)?,
-            },
-            (None, Some(path)) => {
-                Terminal::open(path, config.wrapper, config.session_env.clone())?
+        let display = backend.metrics()?.validate()?;
+        let window = (display.width_px, display.height_px);
+        let cell = backend.cell_size();
+        let base_px = match cell {
+            Some(cell) => {
+                px_for_cell_height(&config.fonts[config.cell_metrics_font], cell.1 as f32)
             }
-            (None, None) => Terminal::new(config.wrapper, config.session_env.clone())?,
+            None => 16.0 * display.scale_factor,
         };
-        if config.watch_resize {
-            term.watch_resize()?;
-        }
-        let colors = term.query_colors()?;
-        let ws = term.size()?;
-        let cell = term.cell_size()?.unwrap_or(crate::terminal::DEFAULT_CELL);
-        let window = window_from(&ws, cell, false);
-        let base_px = px_for_cell_height(&config.fonts[config.cell_metrics_font], cell.1 as f32);
-        let native = if term.is_hosted() && !term.is_embedded() {
-            None
-        } else {
-            NativeScroll::spawn(term.waker().ok())
+        let colors = backend.colors();
+        let native = match backend.terminal_mut() {
+            Some(term) if !term.is_hosted() || term.is_embedded() => {
+                NativeScroll::spawn(term.waker().ok())
+            }
+            _ => None,
         };
         let use_native = native.is_some();
-        let pixel_mouse = term.reports_pixel_mouse();
+        let pixel_mouse = backend.capabilities().pixel_pointer;
         logging::info(
             "engine",
             format!(
-                "started {}x{}px, cell {}x{}, base {base_px:.1}px, native scroll {}{}",
-                window.0,
-                window.1,
-                cell.0,
-                cell.1,
-                use_native,
-                if term.relayed() {
-                    ", tmux passthrough"
-                } else {
-                    ""
-                }
+                "started {}x{}px, cell {cell:?}, base {base_px:.1}px, native scroll {use_native}",
+                window.0, window.1
             ),
         );
-        let engine = Self {
-            term,
-            session_env: config.session_env,
+        Ok(Self {
+            backend,
+            display,
             comp: Compositor::new(window),
             fonts: config.fonts,
             cell_metrics_font: config.cell_metrics_font,
             cell,
-            cell_estimate: ws.cell_size(),
             base_px,
             colors,
             cursor: None,
@@ -456,19 +401,26 @@ impl Engine {
             last_pointer_click: None,
             next_pasted_mark: 1 << 48,
             pending: Vec::new(),
-            awaiting_cell: None,
-            cell_exact: false,
-            color_request_at: None,
-            last_color_request: None,
             last_step: Instant::now(),
             last_frame: Instant::now(),
             last_frame_bytes: 0,
             frame_deferred: false,
-            max_fps,
+            max_fps: frame::DEFAULT_MAX_FPS,
             frame_due: None,
             stats: FrameStats::default(),
-        };
-        Ok(engine)
+        })
+    }
+
+    pub fn terminal(&self) -> Option<&Terminal> {
+        self.backend.terminal()
+    }
+
+    pub fn terminal_mut(&mut self) -> Option<&mut Terminal> {
+        self.backend.terminal_mut()
+    }
+
+    pub fn waker(&mut self) -> io::Result<Waker> {
+        self.backend.waker()
     }
 
     pub fn add_font_face(&mut self, family: &str, weight: u16, italic: bool, face: fontdue::Font, source: &str) {
@@ -555,6 +507,7 @@ impl Engine {
                 height: size.1,
                 cell: self.cell,
                 base_px: self.base_px,
+                scale_factor: self.display.scale_factor,
             });
         }
     }
@@ -637,10 +590,9 @@ impl Engine {
         &mut self,
         out_empty: bool,
         wait: Option<Duration>,
-    ) -> io::Result<Option<crate::terminal::Event>> {
+    ) -> io::Result<Option<Event>> {
         self.frame()?;
         self.sync_pointer_shape();
-        self.send_due_color_request()?;
         let mut first_wait = if self.frame_deferred && let Some(due) = self.frame_due {
             Some(due.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))
         } else if self.animating() || self.frame_deferred {
@@ -653,26 +605,21 @@ impl Engine {
         let deadlines = [
             self.clipboard.osc_deadline(),
             self.focus_click.as_ref().map(|(deadline, _)| *deadline),
-            self.color_request_at,
-            self.awaiting_cell.as_ref().map(|(_, at)| *at),
-            self.term.idle_flatten_at(),
-            self.term.overlay_due(),
+            self.backend.terminal().and_then(Terminal::idle_flatten_at),
+            self.backend.terminal().and_then(Terminal::overlay_due),
         ];
         for deadline in deadlines.into_iter().flatten() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             first_wait = Some(first_wait.map_or(remaining, |w| w.min(remaining)));
         }
-        if self.term.relayed() {
-            first_wait = Some(first_wait.map_or(RELAYED_RESIZE_POLL, |w| w.min(RELAYED_RESIZE_POLL)));
-        }
-        self.term.poll_event(first_wait)
+        self.backend.poll_event(first_wait)
     }
 
     pub fn pump(&mut self, wait: Option<Duration>) -> io::Result<Vec<EngineEvent>> {
         if !self.throttle_registered {
             self.throttle_registered = true;
             self.cpu_throttle.register_current_thread();
-            if let Ok(waker) = self.term.waker() {
+            if let Ok(waker) = self.backend.waker() {
                 crate::image_cache::set_waker(move || waker.wake());
             }
         }
@@ -685,14 +632,19 @@ impl Engine {
             return Ok(out);
         }
         self.check_resize(&mut out)?;
-        let mut event = self.term.poll_event(Some(Duration::ZERO))?;
+        let mut event = self.backend.poll_event(Some(Duration::ZERO))?;
         let input_pending = event.is_some();
         if !input_pending {
             event = self.paint_then_wait(out.is_empty(), wait)?;
         }
         while let Some(current) = event {
+            let closing = matches!(&current, Event::CloseRequested);
             self.handle_event(current, &mut out)?;
-            event = self.term.poll_event(Some(Duration::ZERO))?;
+            if closing {
+                self.drain_logs(&mut out);
+                return Ok(out);
+            }
+            event = self.backend.poll_event(Some(Duration::ZERO))?;
         }
         if let Some((deadline, point)) = self.focus_click
             && Instant::now() >= deadline
@@ -712,7 +664,6 @@ impl Engine {
             }
         }
         self.check_resize(&mut out)?;
-        self.apply_overdue_window()?;
         self.drain_native(&mut out);
         let now = Instant::now();
         let dt = now.duration_since(self.last_step).as_secs_f32().min(0.05);
@@ -743,7 +694,7 @@ impl Engine {
         }
         for (view, node, image) in self
             .clipboard
-            .resolve_pastes(&mut self.term, drained.pastes)
+            .resolve_pastes(&mut *self.backend, drained.pastes)
         {
             let mut out = std::mem::take(&mut self.pending);
             self.push_paste_image(view, node, image, &mut out);
@@ -771,35 +722,6 @@ impl Engine {
         out.extend(entries.into_iter().map(EngineEvent::Log));
     }
 
-    fn schedule_color_request(&mut self, delay: Duration) {
-        let at = Instant::now() + delay;
-        self.color_request_at = Some(self.color_request_at.map_or(at, |queued| queued.min(at)));
-    }
-
-    fn recheck_colors_on_focus(&mut self) {
-        if self.term.reports_color_scheme() {
-            return;
-        }
-        let stale = self
-            .last_color_request
-            .is_none_or(|at| at.elapsed() >= COLOR_REQUEST_INTERVAL);
-        if stale {
-            self.schedule_color_request(Duration::ZERO);
-        }
-    }
-
-    fn send_due_color_request(&mut self) -> io::Result<()> {
-        let Some(at) = self.color_request_at else {
-            return Ok(());
-        };
-        if Instant::now() < at {
-            return Ok(());
-        }
-        self.color_request_at = None;
-        self.last_color_request = Some(Instant::now());
-        self.term.request_colors()
-    }
-
     fn apply_colors(&mut self, colors: TerminalColors, out: &mut Vec<EngineEvent>) {
         if colors == self.colors {
             return;
@@ -817,107 +739,51 @@ impl Engine {
     }
 
     fn check_resize(&mut self, out: &mut Vec<EngineEvent>) -> io::Result<()> {
-        let ws = self.term.size()?;
-        if ws.cols == 0 && ws.width_px == 0 {
+        let display = self.backend.metrics()?.validate()?;
+        let cell = self.backend.cell_size();
+        if display == self.display && cell == self.cell {
             return Ok(());
         }
-        self.apply_window(&ws, "ioctl")?;
-        out.append(&mut self.pending);
-        Ok(())
-    }
-
-    fn apply_window(&mut self, ws: &crate::terminal::WindowSize, source: &str) -> io::Result<()> {
-        let estimate = ws.cell_size();
-        if estimate != self.cell_estimate {
-            self.cell_estimate = estimate;
-            if let Some(cell) = self.term.ask_cell_size()? {
-                self.awaiting_cell = None;
-                self.cell_exact = true;
-                return self.resize_to(ws, cell, source);
-            }
-            self.awaiting_cell = Some((*ws, Instant::now() + CELL_REPLY_WAIT));
-        }
-        match &mut self.awaiting_cell {
-            Some((pending, _)) => {
-                *pending = *ws;
-                Ok(())
-            }
-            None => self.resize_to(ws, self.cell, source),
-        }
-    }
-
-    fn apply_overdue_window(&mut self) -> io::Result<()> {
-        let Some((ws, at)) = self.awaiting_cell else {
-            return Ok(());
+        let base_px = match cell {
+            Some(cell) => px_for_cell_height(
+                &self.fonts[self.cell_metrics_font.min(self.fonts.len() - 1)],
+                cell.1 as f32,
+            ),
+            None => 16.0 * display.scale_factor,
         };
-        if Instant::now() < at {
-            return Ok(());
-        }
-        self.awaiting_cell = None;
-        let cell = ws.cell_size().unwrap_or(self.cell);
-        self.cell_exact = false;
-        self.resize_to(&ws, cell, "unanswered cell query")
-    }
-
-    fn resize_to(&mut self, ws: &crate::terminal::WindowSize, cell: (u32, u32), source: &str) -> io::Result<()> {
-        self.term.set_cell_size(cell);
-        let window = window_from(ws, cell, self.cell_exact);
-        if window == self.comp.window && cell == self.cell {
-            return Ok(());
-        }
-        let estimate = ws.cell_size();
-        logging::info(
-            "engine",
-            format!("window size from {source}: {}x{} cells, {}x{} px, estimated cell {:?}", ws.cols, ws.rows, ws.width_px, ws.height_px, estimate),
-        );
-        let base_px = px_for_cell_height(
-            &self.fonts[self.cell_metrics_font.min(self.fonts.len() - 1)],
-            cell.1 as f32,
-        );
         logging::info(
             "engine",
             format!(
-                "resize {}x{} cell {}x{} base {:.1}px -> {}x{} cell {}x{} base {base_px:.1}px",
-                self.comp.window.0,
-                self.comp.window.1,
-                self.cell.0,
-                self.cell.1,
-                self.base_px,
-                window.0,
-                window.1,
-                cell.0,
-                cell.1,
+                "resize {}x{}px scale {}, cell {cell:?}, base {base_px:.1}px",
+                display.width_px, display.height_px, display.scale_factor
             ),
         );
-        crate::profiler::mark("resize", 0, || {
-            format!("resize {}x{} cell {}x{}", window.0, window.1, cell.0, cell.1)
-        });
         let base_changed = (base_px - self.base_px).abs() > 0.01;
         self.hover_oracle.invalidate();
-        self.comp.window = window;
+        self.comp.window = (display.width_px, display.height_px);
+        self.display = display;
         self.cell = cell;
         self.base_px = base_px;
         let resized = self.comp.apply_layout(base_changed);
         self.push_resizes(resized);
+        out.append(&mut self.pending);
         Ok(())
     }
 
     pub fn retarget(&mut self, target: Retarget) -> io::Result<()> {
-        self.term.retarget(target, self.session_env.clone())?;
+        self.backend.retarget(target)?;
         self.pointer_shape = None;
-        self.native = if self.term.is_hosted() && !self.term.is_embedded() {
-            None
-        } else {
-            NativeScroll::spawn(self.term.waker().ok())
+        self.native = match self.backend.terminal_mut() {
+            Some(term) if !term.is_hosted() || term.is_embedded() => {
+                NativeScroll::spawn(term.waker().ok())
+            }
+            _ => None,
         };
         self.use_native = self.native.is_some();
-        self.pixel_mouse = self.term.reports_pixel_mouse();
-        let colors = self.term.query_colors()?;
+        self.pixel_mouse = self.backend.capabilities().pixel_pointer;
         let mut out = Vec::new();
-        self.apply_colors(colors, &mut out);
-        self.cell_estimate = None;
-        let ws = self.term.size()?;
-        self.apply_window(&ws, "retarget")?;
+        self.apply_colors(self.backend.colors(), &mut out);
+        self.check_resize(&mut out)?;
         self.comp.dirty = true;
         self.pending.append(&mut out);
         Ok(())
@@ -987,9 +853,6 @@ impl Engine {
             Event::Focus(focused) => {
                 let gained = focused && !self.term_focused;
                 self.term_focused = focused;
-                if gained {
-                    self.recheck_colors_on_focus();
-                }
                 if !focused {
                     self.focus_click = None;
                 } else if gained
@@ -1004,26 +867,17 @@ impl Engine {
                 }
                 out.push(EngineEvent::Focus { focused });
             }
-            Event::WindowSize(ws) => {
-                self.apply_window(&ws, "in-band report")?;
-                if self.term.is_embedded() {
-                    self.comp.dirty = true;
-                }
+            Event::Resize => self.check_resize(out)?,
+            Event::RedrawRequested => {
+                self.check_resize(out)?;
+                self.comp.dirty = true;
             }
-            Event::CellSize(cell) => {
-                let ws = match self.awaiting_cell.take() {
-                    Some((ws, _)) => ws,
-                    None => self.term.size()?,
-                };
-                self.cell_exact = true;
-                self.resize_to(&ws, cell, "cell size report")?;
-            }
+            Event::CloseRequested => out.push(EngineEvent::CloseRequested),
             Event::Mouse(mouse) => self.handle_mouse(mouse, out)?,
             Event::ClipboardData { items, ok } => {
                 self.clipboard
-                    .handle_clipboard_data(&mut self.term, items, ok)
+                    .handle_clipboard_data(&mut *self.backend, items, ok)
             }
-            Event::ColorSchemeChanged => self.schedule_color_request(COLOR_SETTLE_DELAY),
             Event::Colors(colors) => self.apply_colors(colors, out),
             Event::Devtools => out.push(EngineEvent::Devtools),
             Event::Visible(visible) => out.push(EngineEvent::Visible { visible }),
@@ -1033,13 +887,13 @@ impl Engine {
     }
 
     pub fn set_clipboard(&mut self, text: &str) {
-        if let Err(error) = self.term.set_clipboard(text) {
+        if let Err(error) = self.backend.set_clipboard(text) {
             logging::warn("engine", format!("clipboard write failed: {error}"));
         }
     }
 
     pub fn set_title(&mut self, text: &str) {
-        if let Err(error) = self.term.set_title(text) {
+        if let Err(error) = self.backend.set_title(text) {
             logging::warn("engine", format!("title write failed: {error}"));
         }
     }
@@ -1057,13 +911,13 @@ impl Engine {
     ) -> io::Result<()> {
         let event = self
             .clipboard
-            .begin_rich_capture(&mut self.term, view, text, marks)?;
+            .begin_rich_capture(&mut *self.backend, view, text, marks)?;
         self.pending.extend(event);
         Ok(())
     }
 
     pub fn attach_rich_clipboard(&mut self, token: u64, marks: Vec<(usize, String)>) {
-        self.clipboard.attach_rich(&mut self.term, token, marks);
+        self.clipboard.attach_rich(&mut *self.backend, token, marks);
     }
 
 }
@@ -1076,48 +930,10 @@ pub fn px_for_cell_height(font: &crate::fonts::Font, cell_height: f32) -> f32 {
     (cell_height * 100.0 / probe.new_line_size).clamp(6.0, 512.0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::terminal::WindowSize;
-
-    #[test]
-    fn window_uses_grid_when_pixels_missing() {
-        let ws = WindowSize {
-            cols: 80,
-            rows: 24,
-            width_px: 0,
-            height_px: 0,
-        };
-        assert_eq!(window_from(&ws, (16, 32), false), (80 * 16, 24 * 32));
-    }
-
-    #[test]
-    fn window_is_whole_cells_within_the_reported_pixels() {
-        let ws = WindowSize {
-            cols: 100,
-            rows: 40,
-            width_px: 1007,
-            height_px: 845,
-        };
-        assert_eq!(window_from(&ws, (10, 20), false), (1000, 800));
-        let ws = WindowSize {
-            cols: 100,
-            rows: 40,
-            width_px: 1050,
-            height_px: 800,
-        };
-        assert_eq!(window_from(&ws, (11, 21), false), (1045, 798));
-    }
-
-    #[test]
-    fn a_cell_the_terminal_reported_outranks_relay_pixels() {
-        let ws = WindowSize {
-            cols: 94,
-            rows: 51,
-            width_px: 1504,
-            height_px: 1734,
-        };
-        assert_eq!(window_from(&ws, (19, 42), true), (94 * 19, 51 * 42));
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Err(error) = self.backend.shutdown() {
+            logging::warn("engine", format!("backend shutdown failed: {error}"));
+        }
     }
 }

@@ -275,15 +275,17 @@ unsafe impl Send for SendEngine {}
 
 pub(crate) fn engine_info(engine: &Engine) -> serde_json::Value {
     let (width, height) = engine.comp.window;
-    let (cell_w, cell_h) = engine.cell;
+    let cell_w = engine.cell.map_or(0, |cell| cell.0);
+    let cell_h = engine.cell.map_or(0, |cell| cell.1);
     json!({
         "width": width,
         "height": height,
         "cellWidth": cell_w,
         "cellHeight": cell_h,
         "basePx": engine.base_px,
-        "kittyKeyboard": engine.term.kitty_keyboard(),
-        "hosted": engine.term.is_hosted(),
+        "scaleFactor": engine.display.scale_factor,
+        "kittyKeyboard": engine.terminal().is_some_and(pixel_core::Terminal::kitty_keyboard),
+        "hosted": engine.terminal().is_some_and(pixel_core::Terminal::is_hosted),
         "colors": colors_json(&engine.colors),
     })
 }
@@ -324,9 +326,7 @@ impl PixelEngine {
             Some(env) => pixel_core::SessionEnv::of_session(env),
             None => pixel_core::SessionEnv::of_process(),
         };
-        let mut engine = Engine::new(EngineConfig {
-            fonts,
-            cell_metrics_font: 0,
+        let backend = pixel_core::backend::KittyBackend::new(pixel_core::backend::KittyConfig {
             watch_resize: false,
             tty,
             host: host.map(|host| pixel_core::HostConfig {
@@ -337,9 +337,9 @@ impl PixelEngine {
             }),
             wrapper: pixel_core::wrapper::Wrapper::named(wrapper.as_deref()),
             session_env,
-        })
-        .map_err(err)?;
-        let waker = engine.term.waker().map_err(err)?;
+        }).map_err(err)?;
+        let mut engine = Engine::new(EngineConfig { fonts, cell_metrics_font: 0 }, Box::new(backend)).map_err(err)?;
+        let waker = engine.waker().map_err(err)?;
         engine.cpu_throttle.register_current_thread();
         let info = engine_info(&engine).to_string();
         let (tx, rx) = channel();
@@ -492,7 +492,10 @@ impl PixelEngine {
             .engine
             .as_mut()
             .ok_or_else(|| Error::from_reason("key reporting must be configured before start"))?;
-        engine.term.set_key_event_types(enabled).map_err(err)
+        match engine.terminal_mut() {
+            Some(term) => term.set_key_event_types(enabled).map_err(err),
+            None => Ok(()),
+        }
     }
 
     #[napi]
@@ -528,7 +531,7 @@ impl PixelEngine {
                     Err(e) => break Some(e.to_string()),
                 };
                 autoprofile.tick(&mut engine);
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) || events.iter().any(|event| matches!(event, pixel_core::EngineEvent::CloseRequested)) {
                     break None;
                 }
                 while let Ok(cmd) = rx.try_recv() {

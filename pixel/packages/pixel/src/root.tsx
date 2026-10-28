@@ -268,10 +268,11 @@ export function createRoot(options: RootOptions = {}): Root {
   const becomeOwner = () => {
     if (!tty || !socketPath) return;
     owner = null;
-    server = new OwnerServer(socketPath, () => ({
-      width: engineRoot.info.cellWidth,
-      height: engineRoot.info.cellHeight,
-    }));
+    server = new OwnerServer(socketPath, () => {
+      const { cellWidth, cellHeight } = engineRoot.info;
+      if (cellWidth <= 0 || cellHeight <= 0) throw new Error("terminal hosting requires cell metrics");
+      return { width: cellWidth, height: cellHeight };
+    });
     server.onJoin = (guest) => {
       const focused = views.focused;
       shell.rememberFocus(() => {

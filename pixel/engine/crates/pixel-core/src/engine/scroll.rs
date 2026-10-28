@@ -17,7 +17,7 @@ impl Engine {
                 .iter()
                 .any(|&id| tree.scroll_state(id).is_some_and(|s| !s.settled()))
         });
-        scrolling || self.bars_animating() || self.term.highlight_active()
+        scrolling || self.bars_animating() || self.backend.terminal().is_some_and(crate::Terminal::highlight_active)
     }
 
     pub(super) fn bar_at(&self, view: usize, point: (f32, f32)) -> Option<NodeId> {
@@ -159,10 +159,14 @@ impl Engine {
         }
     }
 
+    pub(super) fn scroll_unit(&self) -> (f32, f32) {
+        self.cell.map_or((self.base_px * 0.5, self.base_px), |cell| (cell.0 as f32, cell.1 as f32))
+    }
+
     fn pane_extent(&self) -> ((f32, f32), (f32, f32)) {
         (
             (self.comp.window.0 as f32, self.comp.window.1 as f32),
-            (self.cell.0 as f32, self.cell.1 as f32),
+            self.scroll_unit(),
         )
     }
 

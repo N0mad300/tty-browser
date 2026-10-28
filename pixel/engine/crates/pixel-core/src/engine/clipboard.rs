@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use super::EngineEvent;
 use crate::clipboard_image::PastedImage;
 use crate::logging;
-use crate::terminal::Terminal;
+use crate::backend::Backend;
 use crate::text_input::MARK_CHAR;
 use crate::tree::NodeId;
 
@@ -93,7 +93,7 @@ pub(super) fn parse_rich_paste(text: &str) -> Option<(String, Vec<(usize, String
     (!marks.is_empty()).then_some((out, marks))
 }
 
-fn request_text_clipboard(term: &mut Terminal) {
+fn request_text_clipboard(term: &mut dyn Backend) {
     if let Err(error) = term.request_clipboard() {
         logging::warn("engine", format!("clipboard request failed: {error}"));
     }
@@ -118,7 +118,7 @@ impl ClipboardFlows {
 
     pub fn begin_rich_capture(
         &mut self,
-        term: &mut Terminal,
+        term: &mut dyn Backend,
         view: usize,
         text: String,
         marks: Vec<(NodeId, crate::text_input::Mark)>,
@@ -154,7 +154,7 @@ impl ClipboardFlows {
         }))
     }
 
-    pub fn attach_rich(&mut self, term: &mut Terminal, token: u64, marks: Vec<(usize, String)>) {
+    pub fn attach_rich(&mut self, term: &mut dyn Backend, token: u64, marks: Vec<(usize, String)>) {
         let Some(rich) = self.rich.as_mut().filter(|r| r.token == token) else {
             return;
         };
@@ -178,7 +178,7 @@ impl ClipboardFlows {
 
     pub fn resolve_pastes(
         &mut self,
-        term: &mut Terminal,
+        term: &mut dyn Backend,
         pastes: Vec<(u64, Option<PastedImage>)>,
     ) -> Vec<(usize, NodeId, PastedImage)> {
         let mut delivered = Vec::new();
@@ -191,8 +191,8 @@ impl ClipboardFlows {
                 Some(image) => delivered.push((view, node, image)),
                 None => {
                     if self.osc.is_none()
-                        && term.clipboard_data_supported()
-                        && term.request_clipboard_types().is_ok()
+                        && term.terminal_mut().is_some_and(|tty| tty.clipboard_data_supported()
+                            && tty.request_clipboard_types().is_ok())
                     {
                         self.osc = Some(OscPaste {
                             view,
@@ -217,7 +217,7 @@ impl ClipboardFlows {
 
     pub fn handle_clipboard_data(
         &mut self,
-        term: &mut Terminal,
+        term: &mut dyn Backend,
         items: Vec<(String, Vec<u8>)>,
         ok: bool,
     ) {
@@ -239,7 +239,7 @@ impl ClipboardFlows {
                     .iter()
                     .find(|(mime, _)| offered.split_whitespace().any(|o| o == *mime));
                 match pick {
-                    Some(&(mime, ext)) if term.request_clipboard_data(mime).is_ok() => {
+                    Some(&(mime, ext)) if term.terminal_mut().is_some_and(|tty| tty.request_clipboard_data(mime).is_ok()) => {
                         self.osc = Some(OscPaste {
                             stage: OscPasteStage::Data { ext },
                             deadline: Instant::now() + Duration::from_secs(20),

@@ -360,16 +360,7 @@ extern "C" fn sigwinch_handler(_: libc::c_int) {
     }
 }
 
-#[derive(Clone)]
-pub struct Waker {
-    fd: std::sync::Arc<rustix::fd::OwnedFd>,
-}
-
-impl Waker {
-    pub fn wake(&self) {
-        let _ = rustix::io::write(&*self.fd, &[1]);
-    }
-}
+pub use crate::backend::Waker;
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionEnv {
@@ -1108,13 +1099,8 @@ impl Terminal {
         if let Some(waker) = &self.waker {
             return Ok(waker.clone());
         }
-        let (rx, tx) = rustix::pipe::pipe()?;
-        rustix::fs::fcntl_setfl(&rx, rustix::fs::OFlags::NONBLOCK)?;
-        rustix::fs::fcntl_setfl(&tx, rustix::fs::OFlags::NONBLOCK)?;
+        let (rx, waker) = Waker::pipe()?;
         self.wake_rx = Some(rx);
-        let waker = Waker {
-            fd: std::sync::Arc::new(tx),
-        };
         self.waker = Some(waker.clone());
         Ok(waker)
     }
@@ -3114,6 +3100,73 @@ mod tty_tests {
         master.write_all(b"\x1b").unwrap();
         let got = term.poll_event(Some(Duration::from_millis(200))).unwrap();
         assert!(got.is_none(), "outside tmux escape arrives as CSI-u: {got:?}");
+    }
+
+    #[test]
+    fn kitty_engine_renders_and_restores_the_terminal_on_drop() {
+        use crate::backend::{KittyBackend, KittyConfig};
+        use crate::{Engine, EngineConfig};
+        let (mut master, slave, path) = open_pty();
+        let _terminal = fake_terminal(&master);
+        let before = rustix::termios::tcgetattr(&slave).unwrap();
+        rustix::termios::tcsetwinsize(
+            &slave,
+            rustix::termios::Winsize {
+                ws_col: 10,
+                ws_row: 3,
+                ws_xpixel: 81,
+                ws_ypixel: 49,
+            },
+        )
+        .unwrap();
+        let backend = KittyBackend::new(KittyConfig {
+            tty: Some(path),
+            watch_resize: true,
+            host: None,
+            wrapper: Wrapper::None,
+            session_env: SessionEnv::of_session(Default::default()),
+        })
+        .unwrap();
+        let mut engine = Engine::new(
+            EngineConfig {
+                fonts: crate::fonts::FontRegistry::bundled(),
+                cell_metrics_font: 0,
+            },
+            Box::new(backend),
+        )
+        .unwrap();
+        assert_eq!(engine.comp.window, (80, 48));
+        assert_eq!(engine.cell, Some((8, 16)));
+        assert!(
+            !rustix::termios::tcgetattr(&slave)
+                .unwrap()
+                .local_modes
+                .contains(rustix::termios::LocalModes::ICANON)
+        );
+        engine.set_clear_color(0, [20, 100, 200, 255]);
+        engine.pump(Some(Duration::ZERO)).unwrap();
+        assert_eq!(
+            &engine.comp.views[0].canvas.pixels[..4],
+            &[20, 100, 200, 255]
+        );
+        master.write_all(b"\x1b[97;;97u").unwrap();
+        let events = engine.pump(Some(Duration::from_millis(500))).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::EngineEvent::Key {
+                event: KeyEvent {
+                    key: Key::Char('a'),
+                    ..
+                },
+                ..
+            }
+        )));
+        drop(engine);
+        let after = rustix::termios::tcgetattr(&slave).unwrap();
+        assert_eq!(after.local_modes, before.local_modes);
+        assert_eq!(after.input_modes, before.input_modes);
+        assert_eq!(after.output_modes, before.output_modes);
+        assert_eq!(after.control_modes, before.control_modes);
     }
 
     #[test]

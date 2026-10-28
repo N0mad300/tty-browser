@@ -48,7 +48,9 @@ export function GuestView({ guest, active }: { guest: Guest; active: boolean }) 
     [guest],
   );
 
-  const cell = registry.root.info;
+  const { cellWidth, cellHeight } = registry.root.info;
+  if (cellWidth <= 0 || cellHeight <= 0) throw new Error("terminal guests require cell metrics");
+  const cell = { cellWidth, cellHeight };
   const snapped = rect
     ? {
         width: Math.floor(rect.width / cell.cellWidth) * cell.cellWidth,

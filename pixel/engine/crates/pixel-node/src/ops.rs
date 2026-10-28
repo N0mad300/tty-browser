@@ -924,7 +924,9 @@ fn apply_op(
                 engine.set_max_fps(fps);
             }
             if let Some(on) = highlight_transmits {
-                engine.term.set_highlight_transmits(on);
+                if let Some(term) = engine.terminal_mut() {
+                    term.set_highlight_transmits(on);
+                }
             }
             if let Some(on) = frame_events {
                 engine.set_frame_events(on);

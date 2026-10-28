@@ -322,9 +322,9 @@ impl Engine {
                 let view = self.comp.view_at(point.0);
                 let local = self.comp.to_local(view, point);
                 let delta = if mouse.kind == MouseKind::ScrollLeft {
-                    -(self.cell.0 as f32)
+                    -(self.scroll_unit().0)
                 } else {
-                    self.cell.0 as f32
+                    self.scroll_unit().0
                 };
                 self.emit_wheel(view, local, delta, 0.0, false, mouse.mods, out);
             }
@@ -333,9 +333,9 @@ impl Engine {
                 self.mark_scroll(view);
                 let local = self.comp.to_local(view, point);
                 let delta = if mouse.kind == MouseKind::ScrollUp {
-                    -(self.cell.1 as f32)
+                    -(self.scroll_unit().1)
                 } else {
-                    self.cell.1 as f32
+                    self.scroll_unit().1
                 };
                 if self.emit_wheel(view, local, 0.0, delta, false, mouse.mods, out) {
                     return Ok(());
@@ -376,7 +376,7 @@ impl Engine {
             return;
         }
         let shape = shape.to_string();
-        if self.term.set_pointer_shape(&shape).is_ok() {
+        if self.backend.set_pointer_shape(&shape).is_ok() {
             self.pointer_shape = Some(shape);
         }
     }

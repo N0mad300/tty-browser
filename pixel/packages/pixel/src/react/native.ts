@@ -65,6 +65,7 @@ export interface EngineInfo {
   height: number;
   cellWidth: number;
   cellHeight: number;
+  scaleFactor: number;
   basePx: number;
   kittyKeyboard: boolean;
   hosted: boolean;
