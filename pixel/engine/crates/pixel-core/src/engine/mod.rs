@@ -411,6 +411,14 @@ impl Engine {
         })
     }
 
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.name()
+    }
+
+    pub fn backend_capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.backend.capabilities()
+    }
+
     pub fn terminal(&self) -> Option<&Terminal> {
         self.backend.terminal()
     }

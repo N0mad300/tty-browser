@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { backendEnvironment, parseLaunchArguments } from "./backend";
 import { appExecutable } from "./app-executable";
 import { announceGuest, findOwner, waitForOwners } from "./instances";
 import { apparmorSetup, linuxSandboxError } from "./sandbox";
@@ -84,39 +85,39 @@ function ownTty(): string {
 }
 
 async function main(): Promise<number> {
-  const args = process.argv.slice(2);
-  const passthrough = args.indexOf("--");
-  const own = passthrough < 0 ? args : args.slice(0, passthrough);
-  const appArgs = passthrough < 0 ? [] : args.slice(passthrough + 1);
-  if (own.includes("--help") || own.includes("-h")) {
+  const launch = parseLaunchArguments(process.argv.slice(2));
+  if (launch.help) {
     process.stdout.write(
-      "usage: pixel [entry|dir] [-- app args]\n  Runs an app's main file inside the pixel runtime, in this terminal pane.\n",
+      "usage: pixel [entry|dir] [--backend auto|kitty|drm] [-- app args]\n" +
+      "  DRM: --drm-card PATH --drm-input PATH [--drm-input PATH] [--drm-connector NAME] [--drm-scale NUMBER]\n" +
+      "  DRM requires an active local Linux VT and a native build with DRM enabled.\n",
     );
     return 0;
   }
-  const stray = own.slice(1).find((arg) => arg.startsWith("-")) ?? own.find((arg) => arg.startsWith("-"));
-  if (stray) {
-    fail(`unknown option ${stray}. pixel takes an entry and nothing else; put your app's arguments after --`);
+  const { backend, appArgs } = launch;
+  const entry = resolveEntry(launch.entry);
+  if (backend.name === "drm") {
+    const { checkNativeBackend } = require("./react/native") as typeof import("./react/native");
+    checkNativeBackend(backend);
   }
-  if (own.length > 1) fail(`unexpected ${own[1]}; put your app's arguments after --`);
-  const entry = resolveEntry(own[0] ?? ".");
-
-  const tty = process.env.PIXEL_TTY ?? ownTty();
-  const owner = findOwner(tty);
-  const announced = owner ? announceGuest(owner, appName(appDir(entry))) : null;
+  let tty: string | undefined;
+  let announced: ReturnType<typeof announceGuest> | null = null;
   let unsupported = false;
-  if (!owner && !process.env.PIXEL_EMBED) {
-    if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      fail("tty required");
+  if (backend.name === "kitty") {
+    tty = process.env.PIXEL_TTY ?? ownTty();
+    const owner = findOwner(tty);
+    announced = owner ? announceGuest(owner, appName(appDir(entry))) : null;
+    if (!owner && !process.env.PIXEL_EMBED) {
+      if (!process.stdin.isTTY || !process.stdout.isTTY) fail("tty required");
+      unsupported = (await checkTerminal(detect())).graphics === "unsupported";
     }
-    unsupported = (await checkTerminal(detect())).graphics === "unsupported";
   }
 
   const electron = electronBinary();
   const chromiumArgs: string[] = [];
   if (process.platform === "linux") {
     let sandboxError = linuxSandboxError(electron);
-    if (sandboxError) {
+    if (sandboxError && backend.name === "kitty") {
       apparmorSetup(electron);
       sandboxError = linuxSandboxError(electron);
     }
@@ -129,9 +130,9 @@ async function main(): Promise<number> {
   }
 
   const bootstrap = path.join(__dirname, "bootstrap.js");
-  const env = { ...process.env };
+  const env = backendEnvironment(backend, process.env);
   delete env.ELECTRON_RUN_AS_NODE;
-  env.PIXEL_TTY = tty;
+  if (tty) env.PIXEL_TTY = tty;
   if (unsupported) env[UNSUPPORTED_ENV] = "1";
   else delete env[UNSUPPORTED_ENV];
   if (announced) env.PIXEL_PANE = announced.pane;
@@ -146,11 +147,11 @@ async function main(): Promise<number> {
     try {
       child.kill(signal);
     } catch {}
-    setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {}
-    }, 2000).unref();
+    if (backend.name === "kitty") {
+      setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch {}
+      }, 2000).unref();
+    }
   };
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, forward(signal));
   const exited = await new Promise<number>((resolve) => {
@@ -165,7 +166,7 @@ async function main(): Promise<number> {
       resolve(code ?? (signal ? 128 : 0));
     });
   });
-  await waitForOwners(tty);
+  if (tty) await waitForOwners(tty);
   return exited;
 }
 

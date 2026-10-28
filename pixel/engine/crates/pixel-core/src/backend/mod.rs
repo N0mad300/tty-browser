@@ -39,6 +39,8 @@ pub struct BackendCapabilities {
     pub damage: bool,
     pub transparency: bool,
     pub pixel_pointer: bool,
+    pub key_releases: bool,
+    pub super_key: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +75,10 @@ pub trait Backend {
     fn present(&mut self, frame: Frame<'_>) -> io::Result<usize>;
     fn poll_event(&mut self, timeout: Option<Duration>) -> io::Result<Option<BackendEvent>>;
     fn waker(&mut self) -> io::Result<Waker>;
+
+    fn name(&self) -> &'static str {
+        "custom"
+    }
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::default()

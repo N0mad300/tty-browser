@@ -1,3 +1,4 @@
+import type { ResolvedBackend } from "../backend";
 import Reconciler from "react-reconciler";
 import { DefaultEventPriority } from "react-reconciler/constants";
 
@@ -271,8 +272,8 @@ export class Bridge {
   private nextId = 1;
   private seq = 0;
 
-  constructor(tty?: string, wrapper?: string, sessionEnv?: NodeJS.ProcessEnv, host?: HostOptions) {
-    this.engine = createNativeEngine(tty, wrapper, sessionEnv, host);
+  constructor(tty?: string, wrapper?: string, sessionEnv?: NodeJS.ProcessEnv, host?: HostOptions, backend?: ResolvedBackend) {
+    this.engine = createNativeEngine(tty, wrapper, sessionEnv, host, backend);
     if (!defaultBridge) defaultBridge = this;
   }
 

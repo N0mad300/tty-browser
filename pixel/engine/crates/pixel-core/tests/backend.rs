@@ -110,6 +110,8 @@ impl Backend for MockBackend {
             damage: true,
             transparency: true,
             pixel_pointer: true,
+            key_releases: true,
+            super_key: true,
         }
     }
 

@@ -1,3 +1,5 @@
+import { resolveBackend } from "../backend";
+import type { BackendOptions } from "../backend";
 import { createElement, Profiler as ReactProfiler, type ReactNode } from "react";
 import { ConcurrentRoot } from "react-reconciler/constants";
 
@@ -165,7 +167,7 @@ export interface EngineKeyEvent {
   mods: KeyMods;
 }
 
-export interface RootOptions {
+export interface RootOptions extends BackendOptions {
   fonts?: FontFace[];
   onKey?: (event: EngineKeyEvent) => void;
   onRightClick?: (event: { x: number; y: number }) => void;
@@ -306,9 +308,10 @@ function fontFaceOp(face: FontFace) {
 }
 
 export function createRoot(options: RootOptions = {}): PixelRoot {
+  const backend = resolveBackend(options, options.sessionEnv);
   const bridge =
-    options.tty || options.host
-      ? new Bridge(options.tty, options.wrapper, options.sessionEnv, options.host)
+    options.tty || options.host || options.backend || options.sessionEnv || backend.name === "drm"
+      ? new Bridge(options.tty, options.wrapper, options.sessionEnv, options.host, backend)
       : getBridge(options.wrapper);
   const devtoolsEnabled = options.devtools !== false;
   if (options.cwd) setProfileDirectory(options.cwd);

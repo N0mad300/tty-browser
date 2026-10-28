@@ -1,3 +1,6 @@
+import { resolveBackend } from "../backend";
+import type { ResolvedBackend } from "../backend";
+
 export interface DamageRect {
   x: number;
   y: number;
@@ -68,6 +71,9 @@ export interface EngineInfo {
   scaleFactor: number;
   basePx: number;
   kittyKeyboard: boolean;
+  backend: "kitty" | "drm";
+  superKey: boolean;
+  keyReleases: boolean;
   hosted: boolean;
   colors: TerminalColors;
 }
@@ -167,7 +173,9 @@ const binding = loadBinding() as {
     wrapper?: string,
     sessionEnv?: Record<string, string>,
     host?: HostOptions,
+    backend?: ResolvedBackend,
   ) => NativeEngine;
+  checkBackend(backend: ResolvedBackend): void;
   highlight(source: string, language: string): HighlightSpan[];
   highlightCaptures(): string[];
   diff(oldSource: string, newSource: string, contextLines?: number): DiffRow[];
@@ -190,6 +198,7 @@ export function createNativeEngine(
   wrapper?: string,
   sessionEnv?: NodeJS.ProcessEnv,
   host?: HostOptions,
+  backend?: ResolvedBackend,
 ): NativeEngine {
   const env = sessionEnv
     ? Object.fromEntries(
@@ -198,7 +207,7 @@ export function createNativeEngine(
         ),
       )
     : undefined;
-  const pixelEngine = new binding.PixelEngine(tty, wrapper, env, host);
+  const pixelEngine = new binding.PixelEngine(tty, wrapper, env, host, backend ?? resolveBackend({}, sessionEnv));
 
   return pixelEngine
 }
@@ -238,4 +247,8 @@ export function captureFilmstrip(
 
 export function parseMarkdown(source: string, streaming?: boolean): MarkdownBlock[] {
   return binding.parseMarkdown(source, streaming);
+}
+
+export function checkNativeBackend(backend: ResolvedBackend): void {
+  binding.checkBackend(backend);
 }

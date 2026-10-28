@@ -1,4 +1,5 @@
 /// <reference path="../electron/electron.d.ts" preserve="true" />
+export type { BackendName, DrmOptions } from "./backend";
 export { createRoot } from "./root";
 export type { LoadOptions, Root, RootOptions } from "./root";
 export type { Instance } from "./instances";

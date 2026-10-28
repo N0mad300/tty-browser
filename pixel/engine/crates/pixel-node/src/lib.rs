@@ -1,3 +1,4 @@
+mod backend;
 mod capture;
 mod diff;
 mod events;
@@ -25,6 +26,7 @@ use napi_derive::napi;
 use pixel_core::{Engine, EngineConfig, TerminalColors, Waker, fontdue};
 use serde_json::json;
 
+use crate::backend::BackendOptions;
 use crate::events::event_json;
 use crate::ops::{IdMap, apply_ops};
 use crate::surface::{SurfaceCommand, SurfaceMailbox, SurfacePixels};
@@ -285,6 +287,9 @@ pub(crate) fn engine_info(engine: &Engine) -> serde_json::Value {
         "basePx": engine.base_px,
         "scaleFactor": engine.display.scale_factor,
         "kittyKeyboard": engine.terminal().is_some_and(pixel_core::Terminal::kitty_keyboard),
+        "backend": engine.backend_name(),
+        "superKey": engine.backend_capabilities().super_key,
+        "keyReleases": engine.backend_capabilities().key_releases,
         "hosted": engine.terminal().is_some_and(pixel_core::Terminal::is_hosted),
         "colors": colors_json(&engine.colors),
     })
@@ -310,6 +315,8 @@ pub struct PixelEngine {
     captures: capture::Registry,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    start_worker: Option<Sender<ThreadsafeFunction<String>>>,
+    wait_for_shutdown: bool,
 }
 
 #[napi]
@@ -320,13 +327,16 @@ impl PixelEngine {
         wrapper: Option<String>,
         session_env: Option<std::collections::HashMap<String, String>>,
         host: Option<HostOptions>,
+        backend_options: Option<BackendOptions>,
     ) -> Result<Self> {
-        let fonts = pixel_core::fonts::FontRegistry::new(load_font(&[], MONO_FONT_BYTES), load_font(SYSTEM_UI_FONTS, UI_FONT_BYTES));
+        let backend_options = backend_options.unwrap_or_else(BackendOptions::kitty);
+        backend_options.validate().map_err(err)?;
+        let direct = backend_options.name == "drm";
         let session_env = match session_env {
             Some(env) => pixel_core::SessionEnv::of_session(env),
             None => pixel_core::SessionEnv::of_process(),
         };
-        let backend = pixel_core::backend::KittyBackend::new(pixel_core::backend::KittyConfig {
+        let kitty = pixel_core::backend::KittyConfig {
             watch_resize: false,
             tty,
             host: host.map(|host| pixel_core::HostConfig {
@@ -337,23 +347,98 @@ impl PixelEngine {
             }),
             wrapper: pixel_core::wrapper::Wrapper::named(wrapper.as_deref()),
             session_env,
-        }).map_err(err)?;
-        let mut engine = Engine::new(EngineConfig { fonts, cell_metrics_font: 0 }, Box::new(backend)).map_err(err)?;
+        };
+        let (tx, rx) = channel();
+        let surfaces = Arc::new(SurfaceMailbox::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        if direct {
+            let (ready_tx, ready_rx) = channel();
+            let (start_tx, start_rx) = channel();
+            let worker_stop = stop.clone();
+            let worker_surfaces = surfaces.clone();
+            let thread = std::thread::spawn(move || {
+                let mut engine = match create_engine(backend_options, kitty) {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let waker = match engine.waker() {
+                    Ok(waker) => waker,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                if ready_tx
+                    .send(Ok((engine_info(&engine).to_string(), waker)))
+                    .is_err()
+                {
+                    return;
+                }
+                loop {
+                    if worker_stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match start_rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                        Ok(callback) => {
+                            run_engine(engine, rx, worker_stop, worker_surfaces, callback);
+                            return;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            match engine.pump(Some(std::time::Duration::ZERO)) {
+                                Ok(events)
+                                    if !events.iter().any(|event| {
+                                        matches!(event, pixel_core::EngineEvent::CloseRequested)
+                                    }) => {}
+                                _ => return,
+                            }
+                        }
+                    }
+                }
+            });
+            let ready = ready_rx
+                .recv()
+                .map_err(|_| Error::from_reason("DRM worker exited during startup"))?;
+            let (info, waker) = match ready {
+                Ok(ready) => ready,
+                Err(error) => {
+                    let _ = thread.join();
+                    return Err(Error::from_reason(error));
+                }
+            };
+            return Ok(Self {
+                engine: None,
+                info,
+                tx,
+                rx: None,
+                waker,
+                surfaces,
+                captures: capture::Registry::default(),
+                stop,
+                thread: Some(thread),
+                start_worker: Some(start_tx),
+                wait_for_shutdown: true,
+            });
+        }
+        let mut engine = create_engine(backend_options, kitty).map_err(err)?;
         let waker = engine.waker().map_err(err)?;
         engine.cpu_throttle.register_current_thread();
         let info = engine_info(&engine).to_string();
-        let (tx, rx) = channel();
         Ok(Self {
             engine: Some(engine),
             info,
             tx,
             rx: Some(rx),
             waker,
-            // who even uses you tho
-            surfaces: Arc::new(SurfaceMailbox::default()),
+            surfaces,
             captures: capture::Registry::default(),
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
             thread: None,
+            start_worker: None,
+            wait_for_shutdown: false,
         })
     }
 
@@ -488,6 +573,9 @@ impl PixelEngine {
 
     #[napi]
     pub fn set_key_event_types(&mut self, enabled: bool) -> Result<()> {
+        if self.start_worker.is_some() {
+            return Ok(());
+        }
         let engine = self
             .engine
             .as_mut()
@@ -504,6 +592,11 @@ impl PixelEngine {
             .create_threadsafe_function(0, |ctx: ThreadSafeCallContext<String>| {
                 Ok(vec![ctx.value])
             })?;
+        if let Some(start) = self.start_worker.take() {
+            return start
+                .send(dispatch_to_node)
+                .map_err(|_| Error::from_reason("DRM worker stopped before start"));
+        }
         let engine = self
             .engine
             .take()
@@ -517,90 +610,8 @@ impl PixelEngine {
         let cell = SendEngine(engine);
         self.thread = Some(std::thread::spawn(move || {
             let cell = cell;
-            let mut engine = cell.0;
-            engine.set_default_menu(true);
-            let mut ids: Vec<IdMap> = (0..engine.comp.views.len())
-                .map(|view| IdMap::new(engine.comp.views[view].tree.root()))
-                .collect();
-            let mut autoprofile = Autoprofile::from_env(&mut engine);
-            let (mut seen_carried, mut seen_lost) = (0u64, 0u64);
-            // event loop
-            let exit_error = loop {
-                let events = match engine.pump(None) {
-                    Ok(events) => events,
-                    Err(e) => break Some(e.to_string()),
-                };
-                autoprofile.tick(&mut engine);
-                if stop.load(Ordering::Relaxed) || events.iter().any(|event| matches!(event, pixel_core::EngineEvent::CloseRequested)) {
-                    break None;
-                }
-                while let Ok(cmd) = rx.try_recv() {
-                    let outcome = apply_ops(&mut engine, &mut ids, &cmd);
-                    if let Some(message) = outcome.error {
-                        pixel_core::logging::error("bridge", message.clone());
-                        let error = json!({ "type": "error", "message": message });
-                        dispatch_to_node.call(
-                            Ok(error.to_string()),
-                            ThreadsafeFunctionCallMode::NonBlocking,
-                        );
-                    }
-                    for reply in outcome.replies {
-                        dispatch_to_node.call(Ok(reply), ThreadsafeFunctionCallMode::NonBlocking);
-                    }
-                }
-                for event in &events {
-                    if let Some(json) = event_json(event, &engine, &ids) {
-                        dispatch_to_node.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
-                    }
-                }
-                let (carried, lost) = surfaces.dropped();
-                if carried > seen_carried {
-                    engine.note(format!(
-                        "mailbox: {} browser frames dropped, damage carried",
-                        carried - seen_carried
-                    ));
-                    seen_carried = carried;
-                }
-                if lost > seen_lost {
-                    engine.note(format!(
-                        "mailbox: {} browser frames dropped, damage lost",
-                        lost - seen_lost
-                    ));
-                    seen_lost = lost;
-                }
-                let mut surface_error = None;
-                for command in surfaces.take() {
-                    match command {
-                        SurfaceCommand::Frame(frame) => {
-                            // draw frame when we have a surface available? is this polled in a loop?
-                            let result = ingest_frame(&mut engine, &frame);
-                            match result {
-                                Ok(rows) => surfaces.recycle(frame, rows),
-                                Err(error) => {
-                                    surface_error = Some(error);
-                                    break;
-                                }
-                            } }
-                        SurfaceCommand::Remove(id) => {
-                            if let Err(error) = engine.delete_surface(id) {
-                                surface_error = Some(error.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-                if surface_error.is_some() {
-                    break surface_error;
-                }
-            };
-            drop(engine);
-            if !stop.load(Ordering::Relaxed) {
-                let exit = json!({ "type": "exit", "error": exit_error });
-                dispatch_to_node.call(
-                    Ok(exit.to_string()),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
+            let engine = cell.0;
+            run_engine(engine, rx, stop, surfaces, dispatch_to_node);
         }));
         Ok(())
     }
@@ -609,7 +620,14 @@ impl PixelEngine {
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.waker.wake();
+        self.start_worker = None;
         if let Some(thread) = self.thread.take() {
+            if self.wait_for_shutdown {
+                if thread.join().is_err() {
+                    pixel_core::logging::error("engine", "DRM worker panicked during shutdown");
+                }
+                return;
+            }
             let (done_tx, done_rx) = channel();
             std::thread::spawn(move || {
                 let _ = thread.join();
@@ -706,3 +724,126 @@ impl PixelEngine {
     }
 }
 
+fn create_engine(
+    options: BackendOptions,
+    kitty: pixel_core::backend::KittyConfig,
+) -> std::io::Result<Engine> {
+    let fonts = pixel_core::fonts::FontRegistry::new(
+        load_font(&[], MONO_FONT_BYTES),
+        load_font(SYSTEM_UI_FONTS, UI_FONT_BYTES),
+    );
+    let backend = backend::open(options, kitty)?;
+    Engine::new(
+        EngineConfig {
+            fonts,
+            cell_metrics_font: 0,
+        },
+        backend,
+    )
+}
+
+impl Drop for PixelEngine {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn run_engine(
+    mut engine: Engine,
+    rx: Receiver<String>,
+    stop: Arc<AtomicBool>,
+    surfaces: Arc<SurfaceMailbox>,
+    dispatch_to_node: ThreadsafeFunction<String>,
+) {
+    if let Ok(waker) = engine.waker() {
+        waker.wake();
+    }
+    engine.set_default_menu(true);
+    let mut ids: Vec<IdMap> = (0..engine.comp.views.len())
+        .map(|view| IdMap::new(engine.comp.views[view].tree.root()))
+        .collect();
+    let mut autoprofile = Autoprofile::from_env(&mut engine);
+    let (mut seen_carried, mut seen_lost) = (0u64, 0u64);
+    // event loop
+    let exit_error = loop {
+        let events = match engine.pump(None) {
+            Ok(events) => events,
+            Err(e) => break Some(e.to_string()),
+        };
+        autoprofile.tick(&mut engine);
+        if stop.load(Ordering::Relaxed)
+            || events
+                .iter()
+                .any(|event| matches!(event, pixel_core::EngineEvent::CloseRequested))
+        {
+            break None;
+        }
+        while let Ok(cmd) = rx.try_recv() {
+            let outcome = apply_ops(&mut engine, &mut ids, &cmd);
+            if let Some(message) = outcome.error {
+                pixel_core::logging::error("bridge", message.clone());
+                let error = json!({ "type": "error", "message": message });
+                dispatch_to_node.call(
+                    Ok(error.to_string()),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+            for reply in outcome.replies {
+                dispatch_to_node.call(Ok(reply), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
+        for event in &events {
+            if let Some(json) = event_json(event, &engine, &ids) {
+                dispatch_to_node.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+            }
+        }
+        let (carried, lost) = surfaces.dropped();
+        if carried > seen_carried {
+            engine.note(format!(
+                "mailbox: {} browser frames dropped, damage carried",
+                carried - seen_carried
+            ));
+            seen_carried = carried;
+        }
+        if lost > seen_lost {
+            engine.note(format!(
+                "mailbox: {} browser frames dropped, damage lost",
+                lost - seen_lost
+            ));
+            seen_lost = lost;
+        }
+        let mut surface_error = None;
+        for command in surfaces.take() {
+            match command {
+                SurfaceCommand::Frame(frame) => {
+                    // draw frame when we have a surface available? is this polled in a loop?
+                    let result = ingest_frame(&mut engine, &frame);
+                    match result {
+                        Ok(rows) => surfaces.recycle(frame, rows),
+                        Err(error) => {
+                            surface_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                SurfaceCommand::Remove(id) => {
+                    if let Err(error) = engine.delete_surface(id) {
+                        surface_error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if surface_error.is_some() {
+            break surface_error;
+        }
+    };
+    drop(engine);
+    if !stop.load(Ordering::Relaxed) {
+        let exit = json!({ "type": "exit", "error": exit_error });
+        dispatch_to_node.call(
+            Ok(exit.to_string()),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+    }
+}

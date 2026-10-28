@@ -8,6 +8,7 @@ import type { ReactNode } from "react";
 
 import { app, screen } from "electron";
 
+import { resolveBackend } from "./backend";
 import { debug } from "./debug";
 import { Shell } from "./host/shell";
 import { OwnerServer } from "./host/server";
@@ -78,7 +79,7 @@ function ownTty(): string | undefined {
   }
 }
 
-const liveRoots = new Set<{ stop(code: number): void }>();
+const liveRoots = new Set<{ stop(code: number): void; cleanup(): void }>();
 let signalsInstalled = false;
 
 function installSignals() {
@@ -89,6 +90,9 @@ function installSignals() {
   };
   process.on("SIGTERM", stopAll(143));
   process.on("SIGHUP", stopAll(129));
+  const cleanup = () => { for (const root of [...liveRoots]) root.cleanup(); };
+  process.on("exit", cleanup);
+  app.on("before-quit", cleanup);
 }
 
 const REJOIN_WAIT_MS = 5000;
@@ -112,17 +116,18 @@ export function createRoot(options: RootOptions = {}): Root {
     );
   }
   const env = options.sessionEnv ?? process.env;
-  const terminal = detect(env);
-  if (env[UNSUPPORTED_ENV]) {
+  const backend = resolveBackend(options, env);
+  const terminal = backend.name === "kitty" ? detect(env) : null;
+  if (backend.name === "kitty" && env[UNSUPPORTED_ENV]) {
     const message = options.onUnsupportedTerminal?.(terminal) ?? "pixel: this terminal doesn't support graphics\n";
     fs.writeSync(1, message);
     app.exit(1);
     throw new Error("this terminal doesn't support graphics");
   }
 
-  const tty = options.tty ?? env.PIXEL_TTY ?? ownTty();
+  const tty = backend.name === "kitty" ? options.tty ?? env.PIXEL_TTY ?? ownTty() : undefined;
 
-  const embed = env.PIXEL_EMBED ?? null;
+  const embed = backend.name === "kitty" ? env.PIXEL_EMBED ?? null : null;
   let owner: Instance | null = tty && !embed ? findOwner(tty) : null;
   const name = options.name ?? app.getName();
   const cellZoom = new CellZoomFollower();
@@ -138,7 +143,7 @@ export function createRoot(options: RootOptions = {}): Root {
     if (stopping) return;
     stopping = true;
     debug("shutdown", { code, hosted: owner != null });
-    liveRoots.delete(root);
+    liveRoots.delete(lifecycle);
     if (embedder) uninstallEmbedderApi(embedder);
     if (registry) {
       for (const host of [...registry.hosts()]) {
@@ -177,6 +182,8 @@ export function createRoot(options: RootOptions = {}): Root {
 
   const engineRoot = createEngineRoot({
     ...options,
+    backend: backend.name,
+    drm: backend.name === "drm" ? backend : undefined,
     tty: owner || embed ? undefined : tty,
     host: owner
       ? {
@@ -187,7 +194,7 @@ export function createRoot(options: RootOptions = {}): Root {
       : embed && tty
         ? { socket: embed, pane: randomBytes(8).toString("hex"), name, tty }
         : undefined,
-    wrapper: options.wrapper ?? (owner || embed ? undefined : terminal?.wrapper),
+    wrapper: backend.name === "kitty" ? options.wrapper ?? (owner || embed ? undefined : terminal?.wrapper) : undefined,
     keyEventTypes: true,
 
     devtools: options.devtools ?? process.env.NODE_ENV !== "production",
@@ -210,7 +217,7 @@ export function createRoot(options: RootOptions = {}): Root {
     },
     onVisible: (visible) => options.onVisible?.(visible),
     onResize: (size) => {
-      const ratio = cellZoom.ratio(engineRoot.info);
+      const ratio = backend.name === "kitty" ? cellZoom.ratio(engineRoot.info) : null;
       if (registry) {
         if (ratio != null) {
           for (const host of registry.hosts()) {
@@ -242,6 +249,9 @@ export function createRoot(options: RootOptions = {}): Root {
       shutdown(error ? 1 : 0);
     },
   });
+  const lifecycle = { stop: (code: number) => shutdown(code), cleanup: () => shutdown(0, () => {}) };
+  liveRoots.add(lifecycle);
+  installSignals();
   initOffscreenMode(engineRoot.sharedTextures);
   cellZoom.ratio(engineRoot.info);
 
@@ -252,8 +262,8 @@ export function createRoot(options: RootOptions = {}): Root {
 
   registry = new ViewRegistry(
     engineRoot,
-    hostDisplayScale(terminal, env),
-    !engineRoot.info.kittyKeyboard,
+    backend.name === "kitty" ? hostDisplayScale(terminal, env) : engineRoot.info.scaleFactor,
+    !engineRoot.info.superKey,
     { quit: (entry: ViewEntry | null) => quit(entry) },
   );
   const views = registry;
@@ -348,8 +358,6 @@ export function createRoot(options: RootOptions = {}): Root {
       if (!stopping && !owner) engineRoot.nudgeResize();
     });
   }
-  installSignals();
-
   const pageRef = createRef<WebViewHandle>();
   const loadURL = (url: string, options: LoadOptions = {}): WebViewHandle => {
     if (pageRef.current) {
@@ -393,10 +401,11 @@ export function createRoot(options: RootOptions = {}): Root {
     },
   };
 
-  try {
-    const hz = screen.getPrimaryDisplay().displayFrequency;
-    if (hz > 0) engineRoot.setRender({ maxFps: hz });
-  } catch {}
-  liveRoots.add(root);
+  if (backend.name === "kitty") {
+    try {
+      const hz = screen.getPrimaryDisplay().displayFrequency;
+      if (hz > 0) engineRoot.setRender({ maxFps: hz });
+    } catch {}
+  }
   return root;
 }

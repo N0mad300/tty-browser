@@ -3,12 +3,14 @@ import fs from "node:fs";
 import path from "node:path";
 
 const release = process.argv.includes("--release");
+const drm = process.argv.includes("--drm");
+if (drm && process.platform !== "linux") throw new Error("DRM native builds require Linux");
 const packageDir = path.resolve(import.meta.dirname, "..");
 const engineDir = path.resolve(packageDir, "..", "..", "engine");
 const platform = `${process.platform}-${process.arch}`;
 const outDir = path.join(packageDir, "..", "native", platform);
 
-execFileSync("cargo", ["build", "-p", "pixel-node", ...(release ? ["--release"] : [])], {
+execFileSync("cargo", ["build", "-p", "pixel-node", ...(release ? ["--release"] : []), ...(drm ? ["--features", "drm"] : [])], {
   cwd: engineDir,
   stdio: "inherit",
 });

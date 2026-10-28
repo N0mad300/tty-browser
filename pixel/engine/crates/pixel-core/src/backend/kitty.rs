@@ -239,11 +239,17 @@ impl Backend for KittyBackend {
         self.term.waker()
     }
 
+    fn name(&self) -> &'static str {
+        "kitty"
+    }
+
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             damage: true,
             transparency: true,
             pixel_pointer: self.term.reports_pixel_mouse(),
+            key_releases: self.term.kitty_keyboard(),
+            super_key: self.term.kitty_keyboard(),
         }
     }
 

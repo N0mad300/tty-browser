@@ -122,6 +122,12 @@ impl DrmBackend {
 
     pub fn new(mut config: DrmConfig) -> io::Result<Self> {
         let console = Console::check()?;
+        if std::env::var("LIBSEAT_BACKEND").as_deref() != Ok("logind") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this DRM prototype requires LIBSEAT_BACKEND=logind",
+            ));
+        }
         config.validate()?;
         let (wake_rx, waker) = Waker::pipe()?;
         let signals = Signals::new(waker.clone())?;
@@ -190,7 +196,7 @@ impl DrmBackend {
                 "the logind seat is not enabled",
             ));
         }
-        backend.console.activate()?;
+        backend.console.activate(&backend.signals)?;
         backend.service()?;
         if backend.resources.borrow().is_none() {
             return Err(io::Error::other(
@@ -392,11 +398,17 @@ impl Backend for DrmBackend {
         Ok(self.waker.clone())
     }
 
+    fn name(&self) -> &'static str {
+        "drm"
+    }
+
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             damage: false,
             transparency: false,
             pixel_pointer: true,
+            key_releases: true,
+            super_key: true,
         }
     }
 

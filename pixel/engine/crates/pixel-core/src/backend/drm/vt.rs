@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use super::session::{SessionInfo, session_info};
 use crate::backend::Waker;
@@ -89,12 +89,6 @@ impl Console {
                 "the controlling TTY must be the active local session VT",
             ));
         }
-        if std::env::var("LIBSEAT_BACKEND").as_deref() != Ok("logind") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "this DRM prototype requires LIBSEAT_BACKEND=logind",
-            ));
-        }
         if std::env::var("XDG_SESSION_TYPE").is_ok_and(|value| value != "tty") {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -131,12 +125,12 @@ impl Console {
         })
     }
 
-    pub fn activate(&mut self) -> io::Result<()> {
+    pub fn activate(&mut self, signals: &Signals) -> io::Result<()> {
         self.ensure_active()?;
         let mut mode = VtMode {
             mode: 1,
-            release_signal: SIGUSR1 as i16,
-            acquire_signal: SIGUSR2 as i16,
+            release_signal: signals.release_signal as i16,
+            acquire_signal: signals.acquire_signal as i16,
             ..VtMode::default()
         };
         self.changed = true;
@@ -228,6 +222,9 @@ pub(super) struct SignalFlags {
 pub(super) struct Signals {
     pub flags: Arc<SignalFlags>,
     registrations: Vec<signal_hook::SigId>,
+    release_signal: i32,
+    acquire_signal: i32,
+    previous_mask: Option<libc::sigset_t>,
 }
 
 impl Signals {
@@ -241,32 +238,93 @@ impl Signals {
         let mut signals = Self {
             flags: Arc::new(SignalFlags::default()),
             registrations: Vec::new(),
+            release_signal: 0,
+            acquire_signal: 0,
+            previous_mask: None,
         };
-        for signal in [SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2] {
+        let mut available = Vec::new();
+        for signal in libc::SIGRTMIN()..=libc::SIGRTMAX() {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            if unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) } == 0
+                && action.sa_sigaction == libc::SIG_DFL
+            {
+                available.push(signal);
+                if available.len() == 2 {
+                    break;
+                }
+            }
+        }
+        if available.len() != 2 {
+            return Err(io::Error::other(
+                "DRM needs two unused real-time signals for VT switching",
+            ));
+        }
+        let release_signal = available[0];
+        let acquire_signal = available[1];
+        signals.release_signal = release_signal;
+        signals.acquire_signal = acquire_signal;
+        for signal in [SIGINT, SIGTERM, SIGHUP, release_signal, acquire_signal] {
             let flags = signals.flags.clone();
             let waker = waker.clone();
             let id = unsafe {
                 signal_hook::low_level::register(signal, move || {
-                    match signal {
-                        SIGUSR1 => &flags.release,
-                        SIGUSR2 => &flags.acquire,
-                        _ => &flags.close,
-                    }
-                    .store(true, Ordering::Relaxed);
+                    let flag = if signal == release_signal {
+                        &flags.release
+                    } else if signal == acquire_signal {
+                        &flags.acquire
+                    } else {
+                        &flags.close
+                    };
+                    flag.store(true, Ordering::Relaxed);
                     waker.wake();
                 })
             }?;
             signals.registrations.push(id);
         }
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut previous_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, release_signal);
+            libc::sigaddset(&mut mask, acquire_signal);
+        }
+        let result = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &mask, &mut previous_mask) };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result));
+        }
+        signals.previous_mask = Some(previous_mask);
         Ok(signals)
     }
 }
 
 impl Drop for Signals {
     fn drop(&mut self) {
+        if let Some(mask) = self.previous_mask.take() {
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+            }
+        }
         for id in self.registrations.drain(..) {
             signal_hook::low_level::unregister(id);
         }
         SIGNALS_IN_USE.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vt_signals_wake_the_owner_without_using_node_inspector_signals() {
+        let (_read, waker) = Waker::pipe().unwrap();
+        let signals = Signals::new(waker).unwrap();
+        assert!(signals.release_signal >= libc::SIGRTMIN());
+        assert!(signals.acquire_signal >= libc::SIGRTMIN());
+        assert_ne!(signals.release_signal, signals.acquire_signal);
+        assert_eq!(unsafe { libc::raise(signals.release_signal) }, 0);
+        assert!(signals.flags.release.load(Ordering::Relaxed));
+        assert_eq!(unsafe { libc::raise(signals.acquire_signal) }, 0);
+        assert!(signals.flags.acquire.load(Ordering::Relaxed));
     }
 }
