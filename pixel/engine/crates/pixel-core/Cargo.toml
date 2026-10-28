@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+drm = ["dep:drm", "dep:libseat", "dep:evdev", "dep:xkbcommon-dl", "dep:libloading", "dep:signal-hook"]
+
 [dependencies]
 rayon = "1"
 rustix = { workspace = true }
@@ -23,3 +26,13 @@ unicode-width = "0.2"
 workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+drm = { version = "0.15", optional = true }
+libseat = { version = "0.2.4", default-features = false, optional = true }
+evdev = { version = "0.13", optional = true }
+xkbcommon-dl = { version = "0.4", optional = true }
+libloading = { version = "0.8", optional = true }
+signal-hook = { version = "0.3", optional = true }
+
+[[example]]
+name = "drm-ui"
+required-features = ["drm"]

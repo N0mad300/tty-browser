@@ -6,6 +6,9 @@ use crate::terminal::{Handoff, KeyEvent, Mods, Mouse, Terminal, TerminalColors};
 
 mod kitty;
 
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub mod drm;
+
 pub use kitty::{HostConfig, KittyBackend, KittyConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
