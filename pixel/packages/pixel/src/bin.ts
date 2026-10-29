@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { backendEnvironment, parseLaunchArguments } from "./backend";
+import { entryArguments } from "./entry";
 import { appExecutable } from "./app-executable";
 import { announceGuest, findOwner, waitForOwners } from "./instances";
 import { apparmorSetup, linuxSandboxError } from "./sandbox";
@@ -139,7 +140,7 @@ async function main(): Promise<number> {
   else delete env.PIXEL_PANE;
   const log = logFile(appDir(entry));
   const stderr = fs.openSync(log, "a");
-  const child = spawn(electron, [bootstrap, entry, ...chromiumArgs, ...appArgs], {
+  const child = spawn(electron, entryArguments(entry, bootstrap, [...chromiumArgs, ...appArgs]), {
     stdio: ["inherit", "inherit", stderr],
     env,
   });

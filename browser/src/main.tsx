@@ -5,12 +5,15 @@ import path from "node:path";
 import { app, screen } from "electron";
 
 import { runDaemon } from "./daemon";
+import { runStandalone } from "./standalone";
+import { parseBrowserArguments } from "./launch";
 import { ConfigStore, LOGS_DIR, SETTINGS_FILE, SHORTCUTS_FILE, ensureDataDir, installedVersion } from "shared";
 import { Telemetry } from "./telemetry";
 import type { CrashSource } from "./telemetry";
 import { appLog } from "@zenbu-labs/pixel";
 import { claimProfile } from "./profile";
 import { registerScheme } from "./pages/scheme";
+const launch = parseBrowserArguments(process.argv.slice(2));
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
 app.commandLine.appendSwitch("disable-background-timer-throttling");
 app.commandLine.appendSwitch("disable-backgrounding-occluded-windows");
@@ -80,5 +83,6 @@ void (async () => {
       .map((d) => `${d.size.width}x${d.size.height}@${d.scaleFactor}x`)
       .join(", ")}`,
   );
-  await runDaemon(cdpPort);
+  if (launch.standalone) await runStandalone(cdpPort, launch.argv);
+  else await runDaemon(cdpPort);
 })().catch((error) => reportAndExit(error, "startup"));

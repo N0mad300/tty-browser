@@ -333,7 +333,6 @@ class Session {
     this.checkForUpdate();
     this.telemetry.launched();
     await this.loadDevtoolsSettings();
-    if (!this.ctx.tty) process.stdout.write(`\x1b]2;${this.marker}\x07`);
     this.root = createRoot({
       name: "terminal-browser",
       tty: this.ctx.tty,
@@ -357,7 +356,8 @@ class Session {
       onQuit: () => this.shutdown(),
       onExit: (code) => this.ctx.onClose(code),
     });
-    this.settings.setNoSuper(!this.root.info.kittyKeyboard);
+    if (!this.ctx.tty) this.root.setTitle(this.marker);
+    this.settings.setNoSuper(!this.root.info.superKey);
     this.applyRenderSettings();
     this.settings.watch();
     this.recalculateLayout();
