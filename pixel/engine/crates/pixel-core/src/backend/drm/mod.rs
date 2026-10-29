@@ -1,4 +1,6 @@
 mod compose;
+mod cursor;
+mod cursor_settings;
 mod display;
 mod input;
 mod keymap;
@@ -119,6 +121,7 @@ pub struct DrmBackend {
     visible: bool,
     closed: bool,
     clipboard: String,
+    pointer_shape: String,
 }
 
 impl DrmBackend {
@@ -194,6 +197,7 @@ impl DrmBackend {
             visible: false,
             closed: false,
             clipboard: String::new(),
+            pointer_shape: "default".into(),
         };
         backend.seat.borrow_mut().dispatch(0).map_err(seat_error)?;
         if !backend.enabled.get() {
@@ -251,7 +255,8 @@ impl DrmBackend {
         let active = self.enabled.get() && self.vt_acquired;
         if active && self.resources.borrow().is_none() {
             self.console.ensure_active()?;
-            let current = Resources::open(&self.config, &self.seat)?;
+            let mut current = Resources::open(&self.config, &self.seat)?;
+            current.display.set_pointer_shape(&self.pointer_shape)?;
             self.metrics = current.display.metrics();
             *self.resources.borrow_mut() = Some(current);
             if !self.enabled.get() {
@@ -420,6 +425,14 @@ impl Backend for DrmBackend {
 
     fn set_clipboard(&mut self, text: &str) -> io::Result<()> {
         self.clipboard = text.to_owned();
+        Ok(())
+    }
+
+    fn set_pointer_shape(&mut self, shape: &str) -> io::Result<()> {
+        self.pointer_shape = shape.into();
+        if let Some(current) = self.resources.borrow_mut().as_mut() {
+            current.display.set_pointer_shape(shape)?;
+        }
         Ok(())
     }
 

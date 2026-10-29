@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use drm::buffer::{Buffer, DrmFourcc};
 use drm::control::{self, Device as _, connector, crtc, dumbbuffer::DumbBuffer, framebuffer};
 
+use super::cursor::Cursor;
 use super::session::SeatDevice;
 use crate::Frame;
 use crate::backend::DisplayMetrics;
@@ -45,6 +46,7 @@ pub(super) struct Display {
     latest: Option<Snapshot>,
     queued: bool,
     cursor: (u32, u32),
+    cursor_theme: Cursor,
     scale: f32,
 }
 
@@ -149,6 +151,7 @@ impl Display {
             latest: None,
             queued: false,
             cursor: (0, 0),
+            cursor_theme: Cursor::new(scale),
             scale,
         };
         let (width, height) = mode.size();
@@ -197,8 +200,16 @@ impl Display {
     }
 
     pub fn set_cursor(&mut self, point: (u32, u32)) -> io::Result<()> {
-        if self.cursor != point {
+        if self.cursor_theme.tick(Instant::now()) || self.cursor != point {
             self.cursor = point;
+            self.queued = self.latest.is_some();
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn set_pointer_shape(&mut self, shape: &str) -> io::Result<()> {
+        if self.cursor_theme.set_shape(shape, Instant::now()) {
             self.queued = self.latest.is_some();
             self.flush()?;
         }
@@ -224,8 +235,13 @@ impl Display {
                 (metrics.width_px, metrics.height_px),
                 pitch,
                 &mut mapping,
-                self.cursor,
             )?;
+            self.cursor_theme.draw(
+                &mut mapping,
+                pitch,
+                (metrics.width_px, metrics.height_px),
+                self.cursor,
+            );
         }
         if !self.installed {
             self.card.set_crtc(
@@ -252,13 +268,20 @@ impl Display {
     }
 
     pub fn deadline(&self) -> Option<Instant> {
+        self.flip_deadline()
+            .into_iter()
+            .chain(self.latest.as_ref().and(self.cursor_theme.deadline()))
+            .min()
+    }
+
+    fn flip_deadline(&self) -> Option<Instant> {
         self.pending_at
             .map(|started| started + Duration::from_secs(2))
     }
 
     pub fn check_timeout(&self) -> io::Result<()> {
         if self
-            .deadline()
+            .flip_deadline()
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             return Err(io::Error::new(
@@ -350,7 +373,6 @@ fn write_xrgb(
     size: (u32, u32),
     pitch: usize,
     target: &mut [u8],
-    cursor: (u32, u32),
 ) -> io::Result<()> {
     let (width, height) = (size.0 as usize, size.1 as usize);
     let row_bytes = width.checked_mul(4).ok_or(io::ErrorKind::InvalidInput)?;
@@ -383,22 +405,6 @@ fn write_xrgb(
             bgra.copy_from_slice(&[channel(rgba[2]), channel(rgba[1]), channel(rgba[0]), 255]);
         }
     }
-    for y in 0..16u32 {
-        for x in 0..=y / 2 {
-            let (Some(px), Some(py)) = (cursor.0.checked_add(x), cursor.1.checked_add(y)) else {
-                continue;
-            };
-            if px < size.0 && py < size.1 {
-                let start = py as usize * pitch + px as usize * 4;
-                let value = if x == 0 || x == y / 2 || y == 15 {
-                    0
-                } else {
-                    255
-                };
-                target[start..start + 4].copy_from_slice(&[value, value, value, 255]);
-            }
-        }
-    }
     Ok(())
 }
 
@@ -412,19 +418,19 @@ mod tests {
         let source = [
             200, 100, 50, 128, 10, 20, 30, 255, 40, 50, 60, 255, 0, 0, 0, 0,
         ];
-        write_xrgb(&source, false, (2, 2), 12, &mut output, (99, 99)).unwrap();
+        write_xrgb(&source, false, (2, 2), 12, &mut output).unwrap();
         assert_eq!(&output[..8], &[25, 50, 100, 255, 30, 20, 10, 255]);
         assert_eq!(&output[8..12], &[99; 4]);
         assert_eq!(&output[12..20], &[60, 50, 40, 255, 0, 0, 0, 255]);
-        write_xrgb(&[25, 50, 100, 128], true, (1, 1), 4, &mut output, (99, 99)).unwrap();
+        write_xrgb(&[25, 50, 100, 128], true, (1, 1), 4, &mut output).unwrap();
         assert_eq!(&output[..4], &[100, 50, 25, 255]);
     }
 
     #[test]
-    fn invalid_buffers_fail_and_edge_cursors_are_clipped() {
-        assert!(write_xrgb(&[0; 16], false, (2, 2), 7, &mut [0; 16], (0, 0)).is_err());
-        assert!(write_xrgb(&[0; 15], false, (2, 2), 8, &mut [0; 16], (0, 0)).is_err());
-        assert!(write_xrgb(&[0; 16], false, (2, 2), 8, &mut [0; 15], (0, 0)).is_err());
-        write_xrgb(&[255; 16], false, (2, 2), 8, &mut [0; 16], (1, 1)).unwrap();
+    fn invalid_buffers_fail_before_scanout_writes() {
+        assert!(write_xrgb(&[0; 16], false, (2, 2), 7, &mut [0; 16]).is_err());
+        assert!(write_xrgb(&[0; 15], false, (2, 2), 8, &mut [0; 16]).is_err());
+        assert!(write_xrgb(&[0; 16], false, (2, 2), 8, &mut [0; 15]).is_err());
+        write_xrgb(&[255; 16], false, (2, 2), 8, &mut [0; 16]).unwrap();
     }
 }

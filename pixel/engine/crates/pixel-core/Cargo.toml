@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-drm = ["dep:drm", "dep:libseat", "dep:evdev", "dep:input", "dep:xkbcommon-dl", "dep:libloading", "dep:signal-hook"]
+drm = ["dep:drm", "dep:libseat", "dep:evdev", "dep:input", "dep:xcursor", "dep:xkbcommon-dl", "dep:libloading", "dep:signal-hook"]
 
 [dependencies]
 rayon = "1"
@@ -30,6 +30,7 @@ drm = { version = "0.15", optional = true }
 libseat = { version = "0.2.4", default-features = false, optional = true }
 evdev = { version = "0.13", optional = true }
 input = { version = "0.9", default-features = false, features = ["libinput_1_19"], optional = true }
+xcursor = { version = "0.3.11", optional = true }
 xkbcommon-dl = { version = "0.4", optional = true }
 libloading = { version = "0.8", optional = true }
 signal-hook = { version = "0.3", optional = true }
