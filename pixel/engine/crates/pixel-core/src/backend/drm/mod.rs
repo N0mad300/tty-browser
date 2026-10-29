@@ -1,5 +1,8 @@
+mod compose;
 mod display;
 mod input;
+mod keymap;
+mod pointer;
 mod session;
 mod vt;
 
@@ -66,12 +69,15 @@ impl Resources {
         let metrics = display.metrics();
         let mut devices = Vec::new();
         for path in &config.input_devices {
-            devices.push(InputDevice::new(SeatDevice::open(seat, path)?)?);
+            let device = SeatDevice::open(seat, path)
+                .and_then(|owner| InputDevice::new(owner, path))
+                .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+            devices.push(device);
         }
         if devices.iter().filter(|device| device.keyboard).count() != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "select exactly one keyboard, and optionally relative mice",
+                "select exactly one keyboard, and optionally mice or touchpads",
             ));
         }
         let input = InputState::new((metrics.width_px, metrics.height_px))?;

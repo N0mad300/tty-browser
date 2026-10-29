@@ -6,9 +6,13 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::ptr::NonNull;
 
-use evdev::{Device, EventSummary, KeyCode, RelativeAxisCode, SynchronizationCode};
+use evdev::{Device, EventSummary, KeyCode};
+use std::path::Path;
 use xkbcommon_dl::{self as xkb, keysyms};
 
+use super::compose::{Compose, ComposedText};
+use super::keymap::KeymapConfig;
+use super::pointer::{PointerInput, PointerUpdate};
 use super::session::SeatDevice;
 use crate::backend::BackendEvent;
 use crate::{Key, KeyEvent, KeyKind, Mods, Mouse, MouseButton, MouseKind};
@@ -18,40 +22,33 @@ pub(super) enum InputAction {
     SwitchVt(u8),
 }
 
+enum DeviceInput {
+    Keyboard(Device),
+    Pointer(PointerInput),
+}
+
 pub(super) struct InputDevice {
-    device: Option<Device>,
+    device: Option<DeviceInput>,
     owner: SeatDevice,
-    high_resolution_x: bool,
-    high_resolution_y: bool,
     pub keyboard: bool,
 }
 
 impl InputDevice {
-    pub fn new(owner: SeatDevice) -> io::Result<Self> {
+    pub fn new(owner: SeatDevice, path: &Path) -> io::Result<Self> {
         let device = Device::from_fd(owner.as_fd().try_clone_to_owned()?)?;
-        device.set_nonblocking(true)?;
         let keyboard = device
             .supported_keys()
             .is_some_and(|keys| keys.contains(KeyCode::KEY_A) && keys.contains(KeyCode::KEY_ENTER));
-        let relative = device.supported_relative_axes();
-        let pointer = relative.is_some_and(|axes| {
-            axes.contains(RelativeAxisCode::REL_X) && axes.contains(RelativeAxisCode::REL_Y)
-        });
-        if !keyboard && !pointer {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "select a keyboard or relative mouse; absolute devices and touchpads are not supported",
-            ));
-        }
-        let high_resolution_x =
-            relative.is_some_and(|axes| axes.contains(RelativeAxisCode::REL_HWHEEL_HI_RES));
-        let high_resolution_y =
-            relative.is_some_and(|axes| axes.contains(RelativeAxisCode::REL_WHEEL_HI_RES));
+        let device = if keyboard {
+            device.set_nonblocking(true)?;
+            DeviceInput::Keyboard(device)
+        } else {
+            drop(device);
+            DeviceInput::Pointer(PointerInput::new(&owner, path)?)
+        };
         Ok(Self {
             device: Some(device),
             owner,
-            high_resolution_x,
-            high_resolution_y,
             keyboard,
         })
     }
@@ -61,24 +58,26 @@ impl InputDevice {
         input: &mut InputState,
         actions: &mut Vec<InputAction>,
     ) -> io::Result<()> {
-        let Some(device) = &mut self.device else {
-            return Ok(());
-        };
-        match device.fetch_events() {
-            Ok(events) => {
-                for event in events {
-                    input.event(
-                        event.destructure(),
-                        self.high_resolution_x,
-                        self.high_resolution_y,
-                        actions,
-                    );
+        match self.device.as_mut() {
+            Some(DeviceInput::Pointer(pointer)) => pointer.read(input, actions),
+            Some(DeviceInput::Keyboard(device)) => {
+                match device.fetch_events() {
+                    Ok(events) => {
+                        for event in events {
+                            if let EventSummary::Key(_, code, value) = event.destructure()
+                                && code.0 < 0x100
+                            {
+                                input.key(code.0, value, actions);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => return Err(error),
                 }
+                Ok(())
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub fn release(&mut self, seat: &mut libseat::SeatRef) -> io::Result<()> {
@@ -89,7 +88,10 @@ impl InputDevice {
 
 impl AsFd for InputDevice {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.device.as_ref().expect("input device is open").as_fd()
+        match self.device.as_ref().expect("input device is open") {
+            DeviceInput::Keyboard(device) => device.as_fd(),
+            DeviceInput::Pointer(pointer) => pointer.as_fd(),
+        }
     }
 }
 
@@ -99,14 +101,23 @@ struct Keyboard {
     keymap: NonNull<xkb::xkb_keymap>,
     state: NonNull<xkb::xkb_state>,
     pressed: BTreeMap<u16, Key>,
+    compose: Option<Compose>,
 }
 
 impl Keyboard {
     fn new() -> io::Result<Self> {
-        Self::with_layout(None)
+        Self::with_config(&KeymapConfig::load()?)
     }
 
+    #[cfg(test)]
     fn with_layout(layout: Option<&CStr>) -> io::Result<Self> {
+        Self::with_config(&KeymapConfig {
+            layout: layout.map(CStr::to_owned),
+            ..KeymapConfig::default()
+        })
+    }
+
+    fn with_config(config: &KeymapConfig) -> io::Result<Self> {
         let api = xkb::xkbcommon_option().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -119,11 +130,26 @@ impl Keyboard {
             ))
             .ok_or_else(|| io::Error::other("could not create XKB context"))?;
             let names = xkb::xkb_rule_names {
-                rules: std::ptr::null(),
-                model: std::ptr::null(),
-                layout: layout.map_or(std::ptr::null(), CStr::as_ptr),
-                variant: std::ptr::null(),
-                options: std::ptr::null(),
+                rules: config
+                    .rules
+                    .as_deref()
+                    .map_or(std::ptr::null(), CStr::as_ptr),
+                model: config
+                    .model
+                    .as_deref()
+                    .map_or(std::ptr::null(), CStr::as_ptr),
+                layout: config
+                    .layout
+                    .as_deref()
+                    .map_or(std::ptr::null(), CStr::as_ptr),
+                variant: config
+                    .variant
+                    .as_deref()
+                    .map_or(std::ptr::null(), CStr::as_ptr),
+                options: config
+                    .options
+                    .as_deref()
+                    .map_or(std::ptr::null(), CStr::as_ptr),
             };
             let keymap = NonNull::new((api.xkb_keymap_new_from_names)(
                 context.as_ptr(),
@@ -140,13 +166,16 @@ impl Keyboard {
                 (api.xkb_context_unref)(context.as_ptr());
                 return Err(io::Error::other("could not create XKB state"));
             };
-            Ok(Self {
+            let mut keyboard = Self {
                 api,
                 context,
                 keymap,
                 state,
                 pressed: BTreeMap::new(),
-            })
+                compose: None,
+            };
+            keyboard.compose = Some(Compose::new(context)?);
+            Ok(keyboard)
         }
     }
 
@@ -203,6 +232,20 @@ impl Keyboard {
                 && (length as usize) < text.len())
             .then(|| String::from_utf8_lossy(&text[..length as usize]).into_owned())
             .filter(|text| text.chars().all(|ch| !ch.is_control()));
+            let text = if value != 0 && !mods.ctrl && !mods.alt && !mods.sup {
+                match self
+                    .compose
+                    .as_mut()
+                    .expect("keyboard compose state")
+                    .feed(symbol)
+                {
+                    ComposedText::Unchanged => text,
+                    ComposedText::Pending => None,
+                    ComposedText::Text(text) => Some(text),
+                }
+            } else {
+                None
+            };
             KeyEvent {
                 key,
                 mods,
@@ -219,6 +262,7 @@ impl Keyboard {
 
 impl Drop for Keyboard {
     fn drop(&mut self) {
+        self.compose.take();
         unsafe {
             (self.api.xkb_state_unref)(self.state.as_ptr());
             (self.api.xkb_keymap_unref)(self.keymap.as_ptr());
@@ -229,133 +273,115 @@ impl Drop for Keyboard {
 
 pub(super) struct InputState {
     keyboard: Keyboard,
-    point: (u32, u32),
+    point: (f64, f64),
     size: (u32, u32),
-    buttons: BTreeSet<u16>,
-    moved: bool,
+    buttons: BTreeSet<u32>,
 }
 
 impl InputState {
     pub fn new(size: (u32, u32)) -> io::Result<Self> {
         Ok(Self {
             keyboard: Keyboard::new()?,
-            point: (size.0 / 2, size.1 / 2),
+            point: (f64::from(size.0 / 2), f64::from(size.1 / 2)),
             size,
             buttons: BTreeSet::new(),
-            moved: false,
         })
     }
 
     pub fn point(&self) -> (u32, u32) {
-        self.point
+        (self.point.0.round() as u32, self.point.1.round() as u32)
     }
 
     fn mouse(&self, kind: MouseKind, button: MouseButton) -> BackendEvent {
+        let (x, y) = self.point();
         BackendEvent::Mouse(Mouse {
             kind,
             button,
             mods: self.keyboard.mods(),
-            x: self.point.0,
-            y: self.point.1,
+            x,
+            y,
         })
     }
 
-    fn event(
-        &mut self,
-        event: EventSummary,
-        hires_x: bool,
-        hires_y: bool,
-        actions: &mut Vec<InputAction>,
-    ) {
-        let push = |actions: &mut Vec<InputAction>, event| actions.push(InputAction::Event(event));
-        match event {
-            EventSummary::Key(_, code, value) if code.0 < 0x100 => {
-                let event = self.keyboard.key(code.0, value);
-                if event.mods.ctrl
-                    && event.mods.alt
-                    && let Key::Function(vt @ 1..=12) = event.key
-                {
-                    if event.kind == KeyKind::Press {
-                        actions.push(InputAction::SwitchVt(vt));
-                    }
-                } else {
-                    push(actions, BackendEvent::Key(event));
+    fn key(&mut self, code: u16, value: i32, actions: &mut Vec<InputAction>) {
+        let event = self.keyboard.key(code, value);
+        if event.mods.ctrl
+            && event.mods.alt
+            && let Key::Function(vt @ 1..=12) = event.key
+        {
+            if event.kind == KeyKind::Press {
+                actions.push(InputAction::SwitchVt(vt));
+            }
+        } else {
+            actions.push(InputAction::Event(BackendEvent::Key(event)));
+        }
+    }
+
+    pub fn pointer(&mut self, update: PointerUpdate, actions: &mut Vec<InputAction>) {
+        let event = match update {
+            PointerUpdate::Motion(dx, dy) => {
+                let previous = self.point();
+                self.point.0 = move_axis(self.point.0, dx, self.size.0);
+                self.point.1 = move_axis(self.point.1, dy, self.size.1);
+                if self.point() == previous {
+                    return;
                 }
-            }
-            EventSummary::Key(
-                _,
-                code @ (KeyCode::BTN_LEFT | KeyCode::BTN_RIGHT | KeyCode::BTN_MIDDLE),
-                value,
-            ) if value != 2 => {
-                if value == 0 {
-                    self.buttons.remove(&code.0);
-                } else {
-                    self.buttons.insert(code.0);
-                }
-                push(
-                    actions,
-                    self.mouse(
-                        if value == 0 {
-                            MouseKind::Up
-                        } else {
-                            MouseKind::Down
-                        },
-                        mouse_button(code.0),
-                    ),
-                );
-            }
-            EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, value) => {
-                self.point.0 = move_axis(self.point.0, value, self.size.0);
-                self.moved = true;
-            }
-            EventSummary::RelativeAxis(_, RelativeAxisCode::REL_Y, value) => {
-                self.point.1 = move_axis(self.point.1, value, self.size.1);
-                self.moved = true;
-            }
-            EventSummary::RelativeAxis(_, axis, value) => {
-                let delta = match axis {
-                    RelativeAxisCode::REL_WHEEL_HI_RES => Some((0.0, -(value as f32) / 3.0)),
-                    RelativeAxisCode::REL_HWHEEL_HI_RES => Some((value as f32 / 3.0, 0.0)),
-                    RelativeAxisCode::REL_WHEEL if !hires_y => Some((0.0, -(value as f32) * 40.0)),
-                    RelativeAxisCode::REL_HWHEEL if !hires_x => Some((value as f32 * 40.0, 0.0)),
-                    _ => None,
-                };
-                if let Some((delta_x, delta_y)) = delta {
-                    push(
-                        actions,
-                        BackendEvent::Wheel {
-                            x: self.point.0,
-                            y: self.point.1,
-                            delta_x,
-                            delta_y,
-                            mods: self.keyboard.mods(),
-                        },
-                    );
-                }
-            }
-            EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) if self.moved => {
-                self.moved = false;
                 let button = self
                     .buttons
                     .first()
                     .copied()
                     .map_or(MouseButton::None, mouse_button);
-                push(actions, self.mouse(MouseKind::Move, button));
+                self.mouse(MouseKind::Move, button)
             }
-            _ => {}
-        }
+            PointerUpdate::Button(code, pressed) => {
+                let button = mouse_button(code);
+                if button == MouseButton::None {
+                    return;
+                }
+                if pressed {
+                    self.buttons.insert(code);
+                } else {
+                    self.buttons.remove(&code);
+                }
+                self.mouse(
+                    if pressed {
+                        MouseKind::Down
+                    } else {
+                        MouseKind::Up
+                    },
+                    button,
+                )
+            }
+            PointerUpdate::Scroll(dx, dy) => {
+                if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
+                    return;
+                }
+                let (x, y) = self.point();
+                BackendEvent::Wheel {
+                    x,
+                    y,
+                    delta_x: dx as f32,
+                    delta_y: dy as f32,
+                    mods: self.keyboard.mods(),
+                }
+            }
+        };
+        actions.push(InputAction::Event(event));
     }
 }
 
-fn move_axis(position: u32, delta: i32, extent: u32) -> u32 {
-    (i64::from(position) + i64::from(delta)).clamp(0, i64::from(extent.saturating_sub(1))) as u32
+fn move_axis(position: f64, delta: f64, extent: u32) -> f64 {
+    if !delta.is_finite() {
+        return position;
+    }
+    (position + delta).clamp(0.0, f64::from(extent.saturating_sub(1)))
 }
 
-fn mouse_button(code: u16) -> MouseButton {
-    match KeyCode(code) {
-        KeyCode::BTN_LEFT => MouseButton::Left,
-        KeyCode::BTN_RIGHT => MouseButton::Right,
-        KeyCode::BTN_MIDDLE => MouseButton::Middle,
+fn mouse_button(code: u32) -> MouseButton {
+    match code {
+        0x110 => MouseButton::Left,
+        0x111 => MouseButton::Right,
+        0x112 => MouseButton::Middle,
         _ => MouseButton::None,
     }
 }
@@ -398,9 +424,9 @@ mod tests {
 
     #[test]
     fn relative_pointer_stays_inside_physical_pixels() {
-        assert_eq!(move_axis(5, -100, 101), 0);
-        assert_eq!(move_axis(5, 500, 101), 100);
-        assert_eq!(move_axis(5, 0, 101), 5);
+        assert_eq!(move_axis(5.0, -100.0, 101), 0.0);
+        assert_eq!(move_axis(5.0, 500.0, 101), 100.0);
+        assert_eq!(move_axis(5.0, 0.0, 101), 5.0);
     }
 
     #[test]
@@ -411,53 +437,30 @@ mod tests {
         assert_eq!(key_from_symbol(0, 0xe9), Key::Char('é'));
     }
 
-    #[test]
-    fn pointer_batches_drag_at_pixel_coordinates_and_filter_duplicate_wheel_ticks() {
-        let mut input = InputState {
+    fn input() -> InputState {
+        InputState {
             keyboard: Keyboard::with_layout(Some(c"us")).unwrap(),
-            point: (10, 10),
+            point: (10.0, 10.0),
             size: (101, 57),
             buttons: BTreeSet::new(),
-            moved: false,
-        };
-        let mut actions = Vec::new();
-        let events = [
-            evdev::InputEvent::new(evdev::EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, 8),
-            evdev::InputEvent::new(evdev::EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, 5),
-            evdev::InputEvent::new(evdev::EventType::KEY.0, KeyCode::BTN_LEFT.0, 1),
-            evdev::InputEvent::new(
-                evdev::EventType::SYNCHRONIZATION.0,
-                SynchronizationCode::SYN_REPORT.0,
-                0,
-            ),
-            evdev::InputEvent::new(
-                evdev::EventType::RELATIVE.0,
-                RelativeAxisCode::REL_WHEEL.0,
-                1,
-            ),
-            evdev::InputEvent::new(
-                evdev::EventType::RELATIVE.0,
-                RelativeAxisCode::REL_WHEEL_HI_RES.0,
-                120,
-            ),
-        ];
-        for event in events {
-            input.event(event.destructure(), false, true, &mut actions);
         }
-        assert_eq!(input.point(), (18, 15));
-        assert_eq!(actions.len(), 3);
+    }
+
+    #[test]
+    fn touchpad_motion_preserves_fractions_drag_and_scrolling_at_pixel_coordinates() {
+        let mut input = input();
+        let mut actions = Vec::new();
+        input.pointer(PointerUpdate::Motion(0.2, 0.1), &mut actions);
+        assert!(actions.is_empty());
+        input.pointer(PointerUpdate::Motion(0.4, 0.5), &mut actions);
+        assert_eq!(input.point(), (11, 11));
+        input.pointer(PointerUpdate::Button(0x110, true), &mut actions);
+        input.pointer(PointerUpdate::Motion(7.0, 4.0), &mut actions);
+        input.pointer(PointerUpdate::Scroll(2.5, 15.0), &mut actions);
+        input.pointer(PointerUpdate::Button(0x110, false), &mut actions);
+        assert_eq!(actions.len(), 5);
         assert!(matches!(
-            &actions[0],
-            InputAction::Event(BackendEvent::Mouse(Mouse {
-                kind: MouseKind::Down,
-                x: 18,
-                y: 15,
-                button: MouseButton::Left,
-                ..
-            }))
-        ));
-        assert!(matches!(
-            &actions[1],
+            &actions[2],
             InputAction::Event(BackendEvent::Mouse(Mouse {
                 kind: MouseKind::Move,
                 x: 18,
@@ -467,9 +470,73 @@ mod tests {
             }))
         ));
         assert!(matches!(
-            &actions[2],
-            InputAction::Event(BackendEvent::Wheel { delta_y: -40.0, .. })
+            &actions[3],
+            InputAction::Event(BackendEvent::Wheel {
+                x: 18,
+                y: 15,
+                delta_x: 2.5,
+                delta_y: 15.0,
+                ..
+            })
         ));
+        assert!(input.buttons.is_empty());
+        input.pointer(PointerUpdate::Motion(-500.0, 500.0), &mut actions);
+        assert_eq!(input.point(), (0, 56));
+        input.pointer(PointerUpdate::Scroll(0.0, 0.0), &mut actions);
+        input.pointer(PointerUpdate::Motion(f64::NAN, f64::INFINITY), &mut actions);
+        input.pointer(PointerUpdate::Button(0x150, true), &mut actions);
+        assert_eq!(actions.len(), 6);
+    }
+
+    #[test]
+    fn french_layout_produces_azerty_accents_altgr_and_matching_releases() {
+        let mut keyboard = Keyboard::with_layout(Some(c"fr")).unwrap();
+        let key = keyboard.key(KeyCode::KEY_Q.0, 1);
+        assert_eq!(key.key, Key::Char('a'));
+        assert_eq!(key.text.as_deref(), Some("a"));
+        assert_eq!(keyboard.key(KeyCode::KEY_Q.0, 0).key, Key::Char('a'));
+        assert_eq!(keyboard.key(KeyCode::KEY_2.0, 1).text.as_deref(), Some("é"));
+        keyboard.key(KeyCode::KEY_2.0, 0);
+        keyboard.key(KeyCode::KEY_RIGHTALT.0, 1);
+        assert_eq!(keyboard.key(KeyCode::KEY_0.0, 1).text.as_deref(), Some("@"));
+        keyboard.key(KeyCode::KEY_0.0, 0);
+        keyboard.key(KeyCode::KEY_RIGHTALT.0, 0);
+        keyboard.key(KeyCode::KEY_LEFTCTRL.0, 1);
+        let key = keyboard.key(KeyCode::KEY_C.0, 1);
+        assert!(key.mods.ctrl);
+        assert!(key.text.is_none());
+    }
+
+    #[test]
+    fn french_dead_keys_compose_once_and_cancel_cleanly() {
+        let mut keyboard = Keyboard::with_layout(Some(c"fr")).unwrap();
+        assert!(keyboard.key(KeyCode::KEY_LEFTBRACE.0, 1).text.is_none());
+        keyboard.key(KeyCode::KEY_LEFTBRACE.0, 0);
+        assert_eq!(keyboard.key(KeyCode::KEY_E.0, 1).text.as_deref(), Some("ê"));
+        assert!(keyboard.key(KeyCode::KEY_E.0, 0).text.is_none());
+        assert_eq!(keyboard.key(KeyCode::KEY_E.0, 1).text.as_deref(), Some("e"));
+        keyboard.key(KeyCode::KEY_E.0, 0);
+        keyboard.key(KeyCode::KEY_LEFTBRACE.0, 1);
+        keyboard.key(KeyCode::KEY_LEFTBRACE.0, 0);
+        keyboard.key(KeyCode::KEY_ESC.0, 1);
+        keyboard.key(KeyCode::KEY_ESC.0, 0);
+        assert_eq!(keyboard.key(KeyCode::KEY_E.0, 1).text.as_deref(), Some("e"));
+    }
+
+    #[test]
+    fn vt_shortcut_is_consumed_and_pointer_uses_keyboard_modifiers() {
+        let mut input = input();
+        let mut actions = Vec::new();
+        input.key(KeyCode::KEY_LEFTCTRL.0, 1, &mut actions);
+        input.key(KeyCode::KEY_LEFTALT.0, 1, &mut actions);
+        actions.clear();
+        input.key(KeyCode::KEY_F3.0, 1, &mut actions);
+        input.key(KeyCode::KEY_F3.0, 0, &mut actions);
+        assert!(matches!(&actions[..], [InputAction::SwitchVt(3)]));
+        input.pointer(PointerUpdate::Button(0x110, true), &mut actions);
+        assert!(
+            matches!(&actions[1], InputAction::Event(BackendEvent::Mouse(Mouse { mods, .. })) if mods.ctrl && mods.alt)
+        );
     }
 
     #[test]

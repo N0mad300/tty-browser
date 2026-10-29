@@ -91,7 +91,7 @@ mod linux {
         match arguments(std::env::args().skip(1))? {
             Command::Help => {
                 println!(
-                    "usage: drm-ui --check\n       drm-ui --card /dev/dri/cardN --input /dev/input/eventN [--input /dev/input/eventN] [--connector HDMI-A-1] [--scale 1] [--pattern]\n\nRun from your own active local Linux VT with LIBSEAT_BACKEND=logind.\n--check only checks the session and VT; it does not acquire the display.\n--pattern shows moving color bars before testing the native UI.\nEscape exits. Ctrl+Alt+F1..F12 switches VTs. Keyboard plus relative mouse only."
+                    "usage: drm-ui --check\n       drm-ui --card /dev/dri/cardN --input /dev/input/eventN [--input /dev/input/eventN] [--connector HDMI-A-1] [--scale 1] [--pattern]\n\nRun from your own active local Linux VT with LIBSEAT_BACKEND=logind.\n--check only checks the session and VT; it does not acquire the display.\n--pattern shows moving color bars before testing the native UI.\nEscape exits. Ctrl+Alt+F1..F12 switches VTs. Keyboard, mice and touchpads. Uses system XKB settings; override with XKB_DEFAULT_LAYOUT."
                 );
                 Ok(())
             }
