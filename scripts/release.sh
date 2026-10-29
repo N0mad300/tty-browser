@@ -16,7 +16,8 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 rm -rf "$OUT"
-mkdir -p "$STAGE"/{bin,cli/dist,browser/dist,browser/node_modules/@zenbu-labs,electron,agent-browser/bin,assets/fonts,scripts}
+mkdir -p "$STAGE"/{bin,cli/dist,cli/scripts,browser/dist,browser/node_modules/@zenbu-labs,electron,agent-browser/bin,assets/fonts,scripts}
+cp "$ROOT/LICENSE" "$STAGE/LICENSE"
 
 # pixel resolves its engine binary and scroll helper from this package at runtime;
 # both come from the pixel/ workspace packages, built by pixel:build:native
@@ -30,6 +31,7 @@ if [ -z "$NATIVE_PKG" ] || [ ! -f "$NATIVE_PKG/pixel.node" ]; then
   exit 1
 fi
 cp -RL "$NATIVE_PKG" "$STAGE/browser/node_modules/@zenbu-labs/pixel-native-$TARGET"
+ln -s browser/node_modules "$STAGE/node_modules"
 if [ -n "$DARWIN_ARCH" ]; then
   cp "$NATIVE_PKG/native-scroll-helper" "$STAGE/bin/native-scroll-helper"
   rm -f "$STAGE/browser/node_modules/@zenbu-labs/pixel-native-$TARGET/native-scroll-helper"
@@ -40,8 +42,11 @@ cp "$AGENT_BROWSER_BIN" "$STAGE/agent-browser/bin/agent-browser"
 
 "$ROOT/scripts/bundle.sh" "$ROOT/cli/src/main.ts" "$STAGE/cli/dist/main.js"
 "$ROOT/scripts/bundle.sh" "$ROOT/browser/src/main.tsx" "$STAGE/browser/dist/main.js"
+cp "$ROOT/browser/package.json" "$STAGE/browser/package.json"
+printf '{"type":"commonjs","pixel":{"bootstrap":false}}\n' > "$STAGE/browser/dist/package.json"
 
 cp "$ROOT/scripts/apparmor.sh" "$STAGE/scripts/apparmor.sh"
+cp "$ROOT/pixel/packages/pixel/scripts/apparmor.sh" "$STAGE/cli/scripts/apparmor.sh"
 
 "$ROOT/scripts/generate-skill.sh"
 cp -R "$ROOT/skill/build" "$STAGE/skills"
@@ -125,6 +130,7 @@ $NATIVE_SCROLL
 exec "\$ROOT/$ELECTRON_EXE" "\$ROOT/cli/dist/main.js" "\$@"
 EOF
 chmod +x "$STAGE/bin/terminal-browser"
+ln -s terminal-browser "$STAGE/bin/tty-browser"
 echo "$VERSION" > "$STAGE/VERSION"
 echo "$CHANNEL" > "$STAGE/CHANNEL"
 

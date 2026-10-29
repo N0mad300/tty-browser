@@ -34,6 +34,10 @@
       "types": "./dist/app-executable.d.ts",
       "default": "./dist/app-executable.js"
     },
+    "./launcher": {
+      "types": "./dist/launcher.d.ts",
+      "default": "./dist/launcher.js"
+    },
     "./ssh": {
       "types": "./dist/ssh/index.d.ts",
       "default": "./dist/ssh/index.js"

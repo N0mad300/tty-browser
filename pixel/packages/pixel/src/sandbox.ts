@@ -63,7 +63,7 @@ export function linuxSandboxError(electronBinary: string): string | null {
   }
 
   if (kernelSetting("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") === "1") {
-    return "AppArmor blocks unprivileged user namespaces, which the chromium sandbox needs. Run: sudo bash node_modules/@zenbu-labs/pixel/scripts/apparmor.sh <electron binary>]";
+    return `AppArmor blocks unprivileged user namespaces, which the chromium sandbox needs. Run: sudo bash "${APPARMOR_SCRIPT}" "${electronBinary}"`;
   }
 
   if (kernelSetting("/proc/sys/kernel/unprivileged_userns_clone") === "0") {

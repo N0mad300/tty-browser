@@ -6,6 +6,31 @@ interface CommandHelp {
 }
 
 const COMMANDS: Record<string, CommandHelp> = {
+  run: {
+    summary: "Run a foreground browser through Pixel",
+    usage: "terminal-browser run [Pixel options] [-- url and browser options]",
+    body: `
+Runs a browser in the current session. Kitty remains the default backend.
+DRM requires an active local Linux VT and a DRM-enabled native build.
+
+Pixel options:
+  --backend auto|kitty|drm
+  --drm-card PATH
+  --drm-input PATH       Repeat for the keyboard and pointer
+  --drm-connector NAME
+  --drm-scale NUMBER
+
+Pass the initial URL, --transparent or --allow-clipboard-read after --.
+PIXEL_DRM_NATURAL_SCROLL=1 enables natural scrolling for DRM pointers.
+Use Ctrl+Q to quit and restore the console.
+
+Examples:
+  terminal-browser run --backend kitty -- https://example.com
+  terminal-browser run --backend drm --drm-card /dev/dri/card1 \\
+    --drm-input /dev/input/by-path/platform-i8042-serio-0-event-kbd \\
+    --drm-input /dev/input/by-path/your-touchpad-event-mouse -- https://example.com
+`,
+  },
   open: {
     summary: "Open the browser in a terminal pane",
     usage: "terminal-browser open [url] [options]",

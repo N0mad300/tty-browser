@@ -41,6 +41,7 @@ import type { InstanceRecord } from "./registry";
 import { installedVersion, upgradeCommand } from "./upgrade";
 import { claudeBridgeCommand } from "./claude-bridge";
 import { configCommand } from "./config";
+import { launch } from "@zenbu-labs/pixel/launcher";
 
 const DIST_ROOT = process.env.TERMINAL_BROWSER_DIST_ROOT ?? null;
 const CAPABILITIES = ["embedding", "image-frames"] as const;
@@ -730,6 +731,11 @@ async function main(): Promise<number> {
   if (asksForHelp(args)) {
     process.stdout.write(commandHelp(command) ?? rootHelp());
     return 0;
+  }
+  if (command === "run") {
+    process.env.PIXEL_ELECTRON_APP = electronBinary();
+    const { own, passthrough } = splitPassthrough(args);
+    return launch([browserDirectory(), ...own, "--", "--standalone", ...passthrough]);
   }
   if (command !== "setup") ensureSetup();
   if (command === "open") {

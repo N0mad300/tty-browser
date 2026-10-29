@@ -41,6 +41,8 @@ pub(super) struct PointerInput {
 
 impl PointerInput {
     pub fn new(owner: &SeatDevice, path: &Path) -> io::Result<Self> {
+        let natural_scroll =
+            natural_scroll(std::env::var("PIXEL_DRM_NATURAL_SCROLL").ok().as_deref())?;
         let fd = owner.as_fd().try_clone_to_owned()?;
         rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK)?;
         let mut context = Libinput::new_from_path(RestrictedDevice {
@@ -66,6 +68,17 @@ impl PointerInput {
             device.config_tap_set_enabled(true).map_err(|error| {
                 io::Error::other(format!("could not enable touchpad tapping: {error:?}"))
             })?;
+        }
+        if let Some(enabled) = natural_scroll {
+            if device.config_scroll_has_natural_scroll() {
+                device
+                    .config_scroll_set_natural_scroll_enabled(enabled)
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "could not configure natural scrolling: {error:?}"
+                        ))
+                    })?;
+            }
         }
         Ok(Self { context })
     }
@@ -137,6 +150,18 @@ fn wheel_delta(value: f64) -> f64 {
     value / 120.0 * 40.0
 }
 
+fn natural_scroll(value: Option<&str>) -> io::Result<Option<bool>> {
+    match value {
+        None => Ok(None),
+        Some("1" | "true") => Ok(Some(true)),
+        Some("0" | "false") => Ok(Some(false)),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PIXEL_DRM_NATURAL_SCROLL must be 1, true, 0 or false",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +194,18 @@ mod tests {
     fn wheel_units_preserve_partial_detents() {
         assert_eq!(wheel_delta(120.0), 40.0);
         assert_eq!(wheel_delta(-60.0), -20.0);
+    }
+
+    #[test]
+    fn natural_scroll_keeps_the_device_default_unless_explicitly_configured() {
+        assert_eq!(natural_scroll(None).unwrap(), None);
+        for value in ["1", "true"] {
+            assert_eq!(natural_scroll(Some(value)).unwrap(), Some(true));
+        }
+        for value in ["0", "false"] {
+            assert_eq!(natural_scroll(Some(value)).unwrap(), Some(false));
+        }
+        assert!(natural_scroll(Some("yes")).is_err());
+        assert!(natural_scroll(Some("")).is_err());
     }
 }
