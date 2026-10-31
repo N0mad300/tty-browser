@@ -88,7 +88,9 @@ export async function launch(args: string[]): Promise<number> {
   if (launch.help) {
     process.stdout.write(
       "usage: pixel [entry|dir] [--backend auto|kitty|drm] [-- app args]\n" +
+      "  auto uses DRM on an active local Linux VT, otherwise Kitty.\n" +
       "  DRM: --drm-card PATH --drm-input PATH [--drm-input PATH] [--drm-connector NAME] [--drm-scale NUMBER]\n" +
+      "  DRM devices are discovered when omitted; ambiguous choices require explicit flags.\n" +
       "  DRM requires an active local Linux VT and a native build with DRM enabled.\n",
     );
     return 0;

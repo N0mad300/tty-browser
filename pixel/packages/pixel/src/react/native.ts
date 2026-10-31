@@ -176,6 +176,7 @@ const binding = loadBinding() as {
     backend?: ResolvedBackend,
   ) => NativeEngine;
   checkBackend(backend: ResolvedBackend): void;
+  drmSession(): { seat: string };
   highlight(source: string, language: string): HighlightSpan[];
   highlightCaptures(): string[];
   diff(oldSource: string, newSource: string, contextLines?: number): DiffRow[];
@@ -251,4 +252,8 @@ export function parseMarkdown(source: string, streaming?: boolean): MarkdownBloc
 
 export function checkNativeBackend(backend: ResolvedBackend): void {
   binding.checkBackend(backend);
+}
+
+export function drmSession(): { seat: string } {
+  return binding.drmSession();
 }

@@ -150,3 +150,22 @@ pub fn check_backend(options: BackendOptions) -> napi::Result<()> {
     }
     Ok(())
 }
+
+#[napi(object)]
+pub struct DrmSession {
+    pub seat: String,
+}
+
+#[napi]
+pub fn drm_session() -> napi::Result<DrmSession> {
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    {
+        let session = pixel_core::backend::drm::DrmBackend::check_session().map_err(crate::err)?;
+        Ok(DrmSession { seat: session.seat })
+    }
+    #[cfg(not(all(target_os = "linux", feature = "drm")))]
+    Err(crate::err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "DRM is not in this native build; rebuild Pixel with build:native -- --drm on Linux",
+    )))
+}

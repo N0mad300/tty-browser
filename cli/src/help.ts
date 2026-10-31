@@ -10,8 +10,10 @@ const COMMANDS: Record<string, CommandHelp> = {
     summary: "Run a foreground browser through Pixel",
     usage: "terminal-browser run [Pixel options] [-- url and browser options]",
     body: `
-Runs a browser in the current session. Kitty remains the default backend.
-DRM requires an active local Linux VT and a DRM-enabled native build.
+Runs a browser in the current session. Pixel automatically selects Kitty in
+a terminal emulator or DRM on an active local Linux VT. DRM requires a
+DRM-enabled native build. Display and input devices are discovered when omitted;
+ambiguous choices require explicit device flags.
 
 Pixel options:
   --backend auto|kitty|drm
@@ -25,6 +27,8 @@ PIXEL_DRM_NATURAL_SCROLL=1 enables natural scrolling for DRM pointers.
 Use Ctrl+Q to quit and restore the console.
 
 Examples:
+  terminal-browser https://example.com
+  terminal-browser run -- https://example.com
   terminal-browser run --backend kitty -- https://example.com
   terminal-browser run --backend drm --drm-card /dev/dri/card1 \\
     --drm-input /dev/input/by-path/platform-i8042-serio-0-event-kbd \\
@@ -207,6 +211,9 @@ Usage: terminal-browser [url] [options]
        terminal-browser <command> [args]
 
 ${lines.join("\n")}
+
+With no command, runs a foreground browser with Pixel's automatic backend selection.
+Use open for the terminal daemon and pane workflows, or run for backend/device options.
 
 terminal-browser <command> --help for one command's options
 terminal-browser --version prints the installed version

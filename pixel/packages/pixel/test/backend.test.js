@@ -9,7 +9,7 @@ const env = {
   PIXEL_DRM_SCALE: "1.5",
 };
 
-test("auto uses Kitty in a desktop terminal and on a local VT", () => {
+test("desktop environments and a TTY environment variable alone do not select DRM", () => {
   assert.deepEqual(resolveBackend({}, { WAYLAND_DISPLAY: "wayland-1" }, "linux"), { name: "kitty" });
   assert.deepEqual(resolveBackend({}, { XDG_SESSION_TYPE: "tty" }, "linux"), { name: "kitty" });
   assert.deepEqual(resolveBackend({ backend: "kitty" }, env), { name: "kitty" });

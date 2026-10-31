@@ -1,8 +1,10 @@
+import { discoverDrmDevices, isLocalConsole, localDrmSession } from "./backend-auto";
+
 export type BackendName = "auto" | "kitty" | "drm";
 
 export interface DrmOptions {
-  card: string;
-  inputDevices: string[];
+  card?: string;
+  inputDevices?: string[];
   connector?: string;
   scaleFactor?: number;
 }
@@ -21,14 +23,15 @@ export function resolveBackend(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): ResolvedBackend {
-  const name = options.backend ?? env.PIXEL_BACKEND ?? "auto";
-  if (name === "auto" || name === "kitty") {
+  const requested = options.backend ?? env.PIXEL_BACKEND ?? "auto";
+  const name = requested === "auto" ? (isLocalConsole(env, platform) ? "drm" : "kitty") : requested;
+  if (name === "kitty") {
     if (options.drm) throw new Error("DRM options require backend: 'drm'");
     return { name: "kitty" };
   }
   if (name !== "drm") throw new Error(`unknown Pixel backend: ${name}`);
   if (platform !== "linux") throw new Error("the DRM backend requires Linux");
-  const card = options.drm?.card ?? env.PIXEL_DRM_CARD;
+  let card = options.drm?.card ?? env.PIXEL_DRM_CARD;
   let inputDevices: unknown = options.drm?.inputDevices;
   if (inputDevices === undefined && env.PIXEL_DRM_INPUTS !== undefined) {
     try {
@@ -37,15 +40,23 @@ export function resolveBackend(
       throw new Error("PIXEL_DRM_INPUTS must be a JSON array of input device paths");
     }
   }
-  if (!card) throw new Error("the DRM backend requires a card: use --drm-card or PIXEL_DRM_CARD");
-  if (!Array.isArray(inputDevices) || inputDevices.length === 0 || inputDevices.some((device) => typeof device !== "string" || !device)) {
+  if (card === "") throw new Error("the DRM backend requires a card: use --drm-card or PIXEL_DRM_CARD");
+  if (inputDevices !== undefined && (!Array.isArray(inputDevices) || inputDevices.length === 0 || inputDevices.some((device) => typeof device !== "string" || !device))) {
     throw new Error("the DRM backend requires input device paths: use --drm-input or PIXEL_DRM_INPUTS");
   }
-  const connector = options.drm?.connector ?? env.PIXEL_DRM_CONNECTOR;
+  let connector = options.drm?.connector ?? env.PIXEL_DRM_CONNECTOR;
   const scaleFactor = options.drm?.scaleFactor ?? Number(env.PIXEL_DRM_SCALE ?? 1);
   if (!Number.isFinite(scaleFactor) || scaleFactor <= 0 || scaleFactor > 4) {
     throw new Error("DRM scale must be greater than zero, up to 4");
   }
+  if (requested === "auto" || card === undefined || inputDevices === undefined) {
+    const { seat } = localDrmSession();
+    const devices = discoverDrmDevices({ card, connector, inputDevices: inputDevices as string[] | undefined }, seat);
+    card = devices.card;
+    connector = devices.connector;
+    inputDevices = devices.inputDevices;
+  }
+  if (!card || !Array.isArray(inputDevices) || !inputDevices.length) throw new Error("DRM discovery did not find a card and keyboard; use --drm-card and --drm-input");
   return { name, card, inputDevices, connector, scaleFactor };
 }
 
@@ -101,18 +112,7 @@ export function parseLaunchArguments(args: string[], env: NodeJS.ProcessEnv = pr
     }
   }
   if (Object.keys(drm).length) {
-    options.drm = {
-      card: drm.card ?? env.PIXEL_DRM_CARD ?? "",
-      inputDevices: drm.inputDevices ?? resolveInputs(env.PIXEL_DRM_INPUTS),
-      connector: drm.connector,
-      scaleFactor: drm.scaleFactor,
-    };
+    options.drm = drm;
   }
   return { entry: entry ?? ".", appArgs, backend: resolveBackend(options, env, platform), help: false };
-}
-
-function resolveInputs(value: string | undefined): string[] {
-  if (value === undefined) return [];
-  try { return JSON.parse(value); }
-  catch { throw new Error("PIXEL_DRM_INPUTS must be a JSON array of input device paths"); }
 }

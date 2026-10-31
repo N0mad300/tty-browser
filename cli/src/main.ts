@@ -737,7 +737,7 @@ async function main(): Promise<number> {
     const { own, passthrough } = splitPassthrough(args);
     return launch([browserDirectory(), ...own, "--", "--standalone", ...passthrough]);
   }
-  if (command !== "setup") ensureSetup();
+  if (command !== "setup" && (helpTopics().includes(command) || command === "claude-bridge")) ensureSetup();
   if (command === "open") {
     await openCommand(args);
     return 0;
@@ -786,8 +786,8 @@ async function main(): Promise<number> {
     process.stdout.write(commandHelp("open") ?? rootHelp());
     return 0;
   }
-  await openCommand(rest);
-  return 0;
+  process.env.PIXEL_ELECTRON_APP = electronBinary();
+  return launch([browserDirectory(), "--", "--standalone", ...rest]);
 }
 
 void main()
